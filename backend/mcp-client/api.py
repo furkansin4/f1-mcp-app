@@ -138,19 +138,27 @@ async def process_query(request: ChatRequest):
     try:
         with db.connect() as conn:
             if request.conversation_id is not None and request.conversation_id > 0:
-                # Use existing conversation
                 conversation_id = request.conversation_id
 
                 result = conn.execute(text("SELECT id FROM conversations WHERE id = :id"), {"id": conversation_id})
                 if not result.fetchone():
                     raise HTTPException(status_code=404, detail="Conversation not found")
-            else:
 
+                # Restore previous messages into the AI client's context
+                history = conn.execute(
+                    text("SELECT role, message AS content FROM messages WHERE conversation_id = :id ORDER BY created_at ASC"),
+                    {"id": conversation_id},
+                ).fetchall()
+                app.state.client.load_conversation_history([dict(r._mapping) for r in history])
+            else:
                 app.state.client.clear_conversation_history()
-                result = conn.execute(text("INSERT INTO conversations (title, created_at) VALUES (:title, :created_at) RETURNING id"), {
-                    "title": request.query[:50] + "..." if len(request.query) > 50 else request.query,
-                    "created_at": datetime.now()
-                })
+                result = conn.execute(
+                    text("INSERT INTO conversations (title, created_at) VALUES (:title, :created_at) RETURNING id"),
+                    {
+                        "title": request.query[:50] + "..." if len(request.query) > 50 else request.query,
+                        "created_at": datetime.now(),
+                    },
+                )
                 conversation_id = result.fetchone()[0]
                 conn.commit()
 

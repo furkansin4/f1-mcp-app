@@ -208,9 +208,15 @@ class MCPClient:
         await self.exit_stack.aclose()
 
     def clear_conversation_history(self):
-        """Clear the conversation history to start fresh."""
         self.conversation_history = []
-        print("🧹 Conversation history cleared!")
+
+    def load_conversation_history(self, messages: list):
+        """Restore conversation history from persisted messages."""
+        self.conversation_history = [
+            {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
+            for m in messages
+            if m["role"] in ("user", "assistant")
+        ]
 
 async def main():
     import sys

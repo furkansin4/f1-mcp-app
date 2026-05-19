@@ -115,9 +115,13 @@ class MainClient:
         return await self.current_client.process_query(query)
 
     def clear_conversation_history(self):
-        """Clear conversation history for the current client"""
         if self.current_client:
             self.current_client.clear_conversation_history()
+
+    def load_conversation_history(self, messages: list):
+        """Load persisted messages into the active client's context."""
+        if self.current_client:
+            self.current_client.load_conversation_history(messages)
 
     def set_model(self, provider: Literal["anthropic", "openai", "gemini"]):
         """Switch to a different LLM provider"""

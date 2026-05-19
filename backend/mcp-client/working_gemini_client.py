@@ -237,9 +237,21 @@ class MCPClient:
 
 
     def clear_conversation_history(self):
-        """Clear the conversation history to start fresh."""
         self.conversation_history = []
-        print("🧹 Conversation history cleared!")
+
+    def load_conversation_history(self, messages: list):
+        """Restore conversation history from persisted messages."""
+        self.conversation_history = []
+        for m in messages:
+            if m["role"] not in ("user", "assistant"):
+                continue
+            gemini_role = "model" if m["role"] == "assistant" else "user"
+            self.conversation_history.append(
+                types.Content(
+                    role=gemini_role,
+                    parts=[types.Part.from_text(text=m["content"])],
+                )
+            )
 
     def get_conversation_length(self):
         """Get the number of messages in conversation history."""
