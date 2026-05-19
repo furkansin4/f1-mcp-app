@@ -1,4 +1,4 @@
-import { useParams } from "react-router-dom"
+import { useParams, useSearchParams } from "react-router-dom"
 import { useEffect, useState } from "react"
 import { ChatWithSuggestions } from "@/components/app-chat"
 import { getConversationMessages, getConversationTools } from "@/services/api"
@@ -7,6 +7,8 @@ import "./chatPage.css"
 
 export default function ChatPage() {
     const { conversationId } = useParams<{ conversationId: string }>()
+    const [searchParams] = useSearchParams()
+    const initialQuery = searchParams.get("q") ?? undefined
     const [initialMessages, setInitialMessages] = useState<Message[]>([])
     const [loading, setLoading] = useState(false)
     const [conversationTitle, setConversationTitle] = useState<string>("")
@@ -131,9 +133,10 @@ export default function ChatPage() {
                     <h1 className="chat-title">{conversationTitle}</h1>
                 </div>
                 <div className="chat-content">
-                    <ChatWithSuggestions 
+                    <ChatWithSuggestions
                         initialMessages={initialMessages}
                         conversationId={conversationId ? parseInt(conversationId) : null}
+                        initialQuery={initialQuery}
                     />
                 </div>
             </div>

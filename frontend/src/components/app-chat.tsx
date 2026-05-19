@@ -7,11 +7,13 @@ import { useNavigate } from "react-router-dom"
 interface ChatWithSuggestionsProps {
   initialMessages?: Message[]
   conversationId?: number | null
+  initialQuery?: string
 }
 
-export function ChatWithSuggestions({ 
-  initialMessages = [], 
-  conversationId: initialConversationId = null 
+export function ChatWithSuggestions({
+  initialMessages = [],
+  conversationId: initialConversationId = null,
+  initialQuery,
 }: ChatWithSuggestionsProps) {
   const [messages, setMessages] = useState<Message[]>(initialMessages)
   const [input, setInput] = useState("")
@@ -28,6 +30,14 @@ export function ChatWithSuggestions({
   useEffect(() => {
     setConversationId(initialConversationId)
   }, [initialConversationId])
+
+  // Auto-submit a query passed via URL (?q=...)
+  useEffect(() => {
+    if (initialQuery) {
+      sendMessage(initialQuery)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInput(e.target.value)
