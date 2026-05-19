@@ -9,12 +9,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     event_name VARCHAR(100) NOT NULL,
     session_name VARCHAR(50) NOT NULL,
     date TIMESTAMP,
-    api_path VARCHAR(200),
-    session_info JSONB,
-    f1_api_support BOOLEAN,
+    openf1_session_key INTEGER,
     total_laps INTEGER,
-    session_start_time INTERVAL,
-    t0_date TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(season, event_name, session_name)
 );

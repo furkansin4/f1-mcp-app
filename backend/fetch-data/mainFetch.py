@@ -1,594 +1,271 @@
-import fastf1
-import pandas as pd
-from sqlalchemy import create_engine, text
-from datetime import datetime, timedelta
-import logging
-import json
-from typing import Dict
 import os
-import time
+import logging
+import httpx
+from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
 
-logging.basicConfig(filename= 'f1_data_fetch.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('f1_data_fetch.log'),
+        logging.StreamHandler(),
+    ]
+)
 logger = logging.getLogger(__name__)
 
-class F1DataPipeline:
-    def __init__(self, db_config: Dict[str, str]):
-        """
-        Initialize the F1 data pipeline
-        
-        Args:
-            db_config: Dictionary containing database connection parameters
-                      {'host': 'localhost', 'database': 'f1_data', 'user': 'username', 'password': 'password', 'port': '5432'}
-        """
-        self.db_config = db_config
-        self.engine = self._create_engine()
+OPENF1_BASE = "https://api.openf1.org/v1"
 
-    def _create_engine(self):
-        """Create SQLAlchemy engine for PostgreSQL connection"""
-        connection_string = f"postgresql://{self.db_config['user']}:@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['database']}"
-        return create_engine(connection_string)
-    
-    def fetch_and_store_session(self, year: int, event: str, session: str):
-        """
-        Fetch all data for a specific F1 session and store in PostgreSQL
-        
-        Args:
-            year: Season year (e.g., 2023)
-            event: Event name (e.g., 'Bahrain', 'Monaco')
-            session: Session type ('FP1', 'FP2', 'FP3', 'Qualifying', 'Sprint', 'Race')
-        """
-        logger.info(f"Fetching data for {year} {event} {session}")
-        
-        try:
-            # Get session data
-            f1_session = fastf1.get_session(year, event, session)
-            f1_session.load(laps=True, telemetry=True, weather=True, messages=True)
-            
-            # Store session metadata
-            session_id = self._store_session_metadata(f1_session, year, event, session)
 
-            # Store driver/results
-            self._store_drivers(f1_session, session_id)
+def openf1_get(endpoint: str, params: dict) -> list:
+    with httpx.Client(timeout=60.0) as client:
+        response = client.get(
+            f"{OPENF1_BASE}/{endpoint}",
+            params={k: v for k, v in params.items() if v is not None},
+        )
+        response.raise_for_status()
+        return response.json()
 
-            self._store_laps(f1_session, session_id)
 
-            self._store_telemetry(f1_session, session_id)
+def seconds_to_interval(value) -> str | None:
+    """Convert a float (seconds) to a PostgreSQL-compatible interval string."""
+    if value is None:
+        return None
+    return f"{float(value)} seconds"
 
-            self._store_weather(f1_session, session_id)
 
-            self._store_session_status(f1_session, session_id)
+class OpenF1Pipeline:
+    def __init__(self):
+        user     = os.getenv('DB_USER', 'postgres')
+        password = os.getenv('DB_PASSWORD', '')
+        host     = os.getenv('DB_HOST', 'localhost')
+        port     = os.getenv('DB_PORT', '5432')
+        database = os.getenv('DB_NAME', 'f1_db')
+        self.engine = create_engine(
+            f"postgresql://{user}:{password}@{host}:{port}/{database}",
+            pool_pre_ping=True,
+        )
 
-            self._store_track_status(f1_session, session_id)
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
 
-            self._store_race_control_messages(f1_session, session_id)
+    def fetch_year(self, year: int, session_types: list[str] | None = None):
+        if session_types is None:
+            session_types = ['Qualifying', 'Race']
 
-            if session == 'R':
-                self._store_circuit_info(f1_session, session_id)
-            
-            logger.info(f"Successfully stored all data for {year} {event} {session}")
-            return session_id
-            
-        except Exception as e:
-            logger.error(f"Error processing session {year} {event} {session}: {e}")
-            raise
-
-    def convert_datetime_to_string(self, obj):
-        """Convert datetime and timedelta objects to serializable formats"""
-        if isinstance(obj, dict):
-            return {key: self.convert_datetime_to_string(value) for key, value in obj.items()}
-        elif isinstance(obj, list):
-            return [self.convert_datetime_to_string(item) for item in obj]
-        elif isinstance(obj, datetime):
-            return obj.isoformat()
-        elif isinstance(obj, timedelta):
-            return obj.total_seconds()  # Convert to seconds as float
-        else:
-            return obj
-        
-    def convert_timedelta_for_db(self, obj):
-        """Convert timedelta objects to None or string format for database compatibility"""
-        if isinstance(obj, timedelta):
-            # PostgreSQL interval format or None
-            return None
-        return obj
-    
-    def process_dataframe_for_db(self, df):
-        """Process DataFrame to convert timedelta columns for database storage"""
-        df_copy = df.copy()
-        for col in df_copy.columns:
-            if df_copy[col].dtype == 'timedelta64[ns]':
-                df_copy[col] = df_copy[col].apply(lambda x: str(x) if pd.notna(x) else None)
-        return df_copy
-    
-    def _store_session_metadata(self, session, year: int, event: str, session_name: str) -> int:
-        """Store session metadata and return session_id"""
-
-        session_info_dict = None
-        if hasattr(session, 'session_info'):
-            session_info_dict = self.convert_datetime_to_string(dict(session.session_info))
-        
-        # Handle timedelta conversion for session_start_time
-        session_start_time = None
-        if hasattr(session, 'session_start_time') and session.session_start_time is not None:
-            session_start_time = self.convert_timedelta_for_db(session.session_start_time)
-        
-        session_data = {
-            'season': year,
-            'event_name': event,
-            'session_name': session_name,
-            'date': session.date if hasattr(session, 'date') else None,
-            'api_path': session.api_path if hasattr(session, 'api_path') else None,
-            'session_info': json.dumps(session_info_dict) if hasattr(session, 'session_info') else None,
-            'f1_api_support': session.f1_api_support if hasattr(session, 'f1_api_support') else None,
-            'total_laps': session.total_laps if hasattr(session, 'total_laps') else None,
-            'session_start_time': session_start_time,
-            't0_date': session.t0_date if hasattr(session, 't0_date') else None
-        }
-        
-        df = pd.DataFrame([session_data])
-        df = self.process_dataframe_for_db(df)
-        df.to_sql('sessions', self.engine, if_exists='append', index=False, method='multi')
-        
-        # Get the session_id
-        with self.engine.connect() as conn:
-            result = conn.execute(text(
-                "SELECT id FROM sessions WHERE season = :year AND event_name = :event AND session_name = :session ORDER BY id DESC LIMIT 1"
-            ), {"year": year, "event": event, "session": session_name})
-            session_id = result.fetchone()[0]
-        
-        logger.info(f"Stored session metadata with ID: {session_id}")
-        return session_id
-    
-    def _store_drivers(self, session, session_id: int):
-        """Store driver/results data"""
-        
-        if not hasattr(session, 'results') or session.results.empty:
-            logger.warning("No driver results data available")
-            return
-        
-        results_df = session.results.copy()
-        results_df['session_id'] = session_id
-        
-        if hasattr(session.results.iloc[0], 'dnf'):
-            results_df['dnf'] = [driver.dnf for _, driver in session.results.iterrows()]
-        
-        # Map FastF1 columns to database columns
-        column_mapping = {
-            'DriverNumber': 'driver_number',
-            'BroadcastName': 'broadcast_name',
-            'FullName': 'full_name',
-            'Abbreviation': 'driver_id',
-            'DriverId': 'driver_name',
-            'TeamName': 'team_name',
-            'TeamColor': 'team_color',
-            'TeamId': 'team_id',
-            'FirstName': 'first_name',
-            'LastName': 'last_name',
-            'HeadshotUrl': 'headshot_url',
-            'CountryCode': 'country_code',
-            'Position': 'position',
-            'ClassifiedPosition': 'classified_position',
-            'GridPosition': 'grid_position',
-            'Q1': 'q1_time',
-            'Q2': 'q2_time',
-            'Q3': 'q3_time',
-            'Time': 'race_time',
-            'Status': 'status',
-            'Points': 'points'
-        }
-        
-        results_df = results_df.rename(columns=column_mapping)
-        
-        # Select only columns that exist in the dataframe and are in our table
-        existing_columns = [col for col in column_mapping.values() if col in results_df.columns]
-        existing_columns.append('session_id')
-        if 'dnf' in results_df.columns:
-            existing_columns.append('dnf')
-        
-        results_df = results_df[existing_columns]
-        
-        results_df = self.process_dataframe_for_db(results_df)
-        results_df.to_sql('drivers', self.engine, if_exists='append', index=False, method='multi')
-        logger.info(f"Stored {len(results_df)} driver records")
-
-    def _store_laps(self, session, session_id: int):
-        """Store laps data"""
-        if not hasattr(session, 'laps') or session.laps.empty:
-            logger.warning("No laps data available")
-            return
-        
-        laps_df = session.laps.copy()
-        laps_df['session_id'] = session_id
-
-        column_mapping = {
-            'Driver': 'driver_id',
-            'LapNumber': 'lap_number',
-            'LapTime': 'lap_time',
-            'LapStartTime': 'lap_start_time',
-            'LapStartDate': 'lap_start_date',
-            'Stint': 'stint',
-            'PitOutTime': 'pit_out_time',
-            'PitInTime': 'pit_in_time',
-            'Sector1Time': 'sector1_time',
-            'Sector2Time': 'sector2_time',
-            'Sector3Time': 'sector3_time',
-            'Sector1SessionTime': 'sector1_session_time',
-            'Sector2SessionTime': 'sector2_session_time',
-            'Sector3SessionTime': 'sector3_session_time',
-            'SpeedI1': 'speed_i1',
-            'SpeedI2': 'speed_i2',
-            'SpeedFL': 'speed_fl',
-            'SpeedST': 'speed_st',
-            'IsPersonalBest': 'is_personal_best',
-            'Compound': 'compound',
-            'TyreLife': 'tyre_life',
-            'FreshTyre': 'fresh_tyre',
-            'Team': 'team',
-            'TrackStatus': 'track_status',
-            'Position': 'position',
-            'Deleted': 'deleted',
-            'DeletedReason': 'deleted_reason',
-            'FastF1Generated': 'fastf1_generated',
-            'IsAccurate': 'is_accurate',
-            'Time': 'session_time'
-        }
-        
-        laps_df = laps_df.rename(columns=column_mapping)
-
-        # Select only existing columns
-        existing_columns = [col for col in column_mapping.values() if col in laps_df.columns]
-        existing_columns.append('session_id')
-        laps_df = laps_df[existing_columns]
-
-        # Handle batch insertion for large datasets
-        batch_size = 1000
-        for i in range(0, len(laps_df), batch_size):
-            batch = laps_df.iloc[i:i+batch_size]
-            batch = self.process_dataframe_for_db(batch)
-            batch.to_sql('laps', self.engine, if_exists='append', index=False, method='multi')
-            logger.info(f"Stored laps batch {i//batch_size + 1}/{(len(laps_df)-1)//batch_size + 1}")
-        
-        logger.info(f"Stored {len(laps_df)} lap records")
-
-    def _store_telemetry(self, session, session_id: int):
-        """Store telemetry data for all drivers"""
-        logger.info("Starting telemetry data processing")
-        
-        if session.laps.empty:
-            logger.warning("No laps data available for telemetry")
-            return
-        
-        total_records = 0
-        
-        # Get unique drivers from the session
-        drivers = session.laps['Driver'].unique()
-        
-        for driver in drivers:
-            try:
-                logger.info(f"Processing telemetry for driver {driver}")
-                
-                # Get all laps for that driver
-                driver_laps = session.laps[session.laps['Driver'] == driver]
-                
-                if driver_laps.empty:
-                    logger.warning(f"No laps found for driver {driver}")
-                    continue
-                
-                # Get driver number (convert driver abbreviation/name to number if needed)
-                try:
-                    # Try to get driver number from results
-                    driver_info = session.results[session.results['Abbreviation'] == driver]
-                    if not driver_info.empty:
-                        driver_number = driver_info.iloc[0]['DriverNumber']
-                    else:
-                        # Fallback: use the driver identifier as is
-                        driver_number = driver
-                except:
-                    driver_number = driver
-                
-                # Collect telemetry data for all laps of this driver
-                all_telemetry_data = []
-                
-                for idx, lap in driver_laps.iterrows():
-                    try:
-                        # Get telemetry for this specific lap
-                        lap_telemetry = lap.get_telemetry()
-                        
-                        if lap_telemetry.empty:
-                            continue
-                        
-                        # Add lap number to telemetry data
-                        lap_telemetry = lap_telemetry.copy()
-                        lap_telemetry['lap_number'] = lap['LapNumber']
-                        
-                        all_telemetry_data.append(lap_telemetry)
-                        
-                    except Exception as e:
-                        logger.warning(f"Error getting telemetry for driver {driver}, lap {lap['LapNumber']}: {e}")
-                        continue
-                
-                if not all_telemetry_data:
-                    logger.warning(f"No telemetry data collected for driver {driver}")
-                    continue
-                
-                telemetry_data = pd.concat(all_telemetry_data, ignore_index=True)
-                
-                # Prepare dataframe for database
-                telemetry_df = telemetry_data.copy()
-                telemetry_df['session_id'] = session_id
-                telemetry_df['driver_number'] = str(driver_number)
-                telemetry_df['driver_id'] = str(driver)  # Add driver_id field
-                
-                column_mapping = {
-                    'Speed': 'speed',
-                    'RPM': 'rpm',
-                    'nGear': 'n_gear',
-                    'Throttle': 'throttle',
-                    'Brake': 'brake',
-                    'DRS': 'drs',
-                    'X': 'x_position',
-                    'Y': 'y_position',
-                    'Z': 'z_position',
-                    'Status': 'status',
-                    'Source': 'source',
-                    'Time': 'time_elapsed',
-                    'SessionTime': 'session_time',
-                    'Date': 'date_time',
-                    'Distance': 'distance',
-                    'RelativeDistance': 'relative_distance',
-                    'DriverAhead': 'driver_ahead',
-                    'DistanceToDriverAhead': 'distance_to_driver_ahead'
-                }
-                
-                telemetry_df = telemetry_df.rename(columns=column_mapping)
-                
-                # Select existing columns
-                required_columns = ['session_id', 'driver_id', 'driver_number', 'lap_number']
-                optional_columns = [col for col in column_mapping.values() if col in telemetry_df.columns]
-                existing_columns = required_columns + optional_columns
-                
-                # Filter to only include columns that exist in the dataframe
-                final_columns = [col for col in existing_columns if col in telemetry_df.columns]
-                telemetry_df = telemetry_df[final_columns]
-                
-                # Store in batches to handle large datasets
-                batch_size = 5000
-                for i in range(0, len(telemetry_df), batch_size):
-                    batch = telemetry_df.iloc[i:i+batch_size]
-                    batch = self.process_dataframe_for_db(batch)
-                    batch.to_sql('telemetry', self.engine, if_exists='append', index=False, method='multi')
-                    
-                total_records += len(telemetry_df)
-                logger.info(f"Stored {len(telemetry_df)} telemetry records for driver {driver}")
-                
-            except Exception as e:
-                logger.error(f"Error processing telemetry for driver {driver}: {e}")
+        sessions = openf1_get("sessions", {"year": year})
+        for session in sessions:
+            if session.get('session_name') not in session_types:
                 continue
-        
-        logger.info(f"Stored {total_records} total telemetry records")
+            self._process_session(session, year)
 
-    def _store_weather(self, session, session_id: int):
-        """Store weather data"""
-        logger.info("Starting weather data processing")
+    # ------------------------------------------------------------------
+    # Per-session orchestration
+    # ------------------------------------------------------------------
 
-        weather_df = session.laps.get_weather_data().copy()
+    def _process_session(self, session: dict, year: int):
+        location     = session.get('location', 'Unknown')
+        session_name = session.get('session_name', '')
+        session_key  = session.get('session_key')
 
-        if weather_df.empty:
-            logger.warning("No weather data available")
-            return
-        
-        weather_df['session_id'] = session_id
+        logger.info(f"Processing {year} {location} {session_name} (key={session_key})")
+        try:
+            session_id = self._store_session(session, year)
+            driver_map = self._store_drivers(session_key, session_id)
+            self._store_laps(session_key, session_id, driver_map)
+            self._store_weather(session_key, session_id)
+            self._store_race_control(session_key, session_id)
+            logger.info(f"✓ {year} {location} {session_name}")
+        except Exception as e:
+            logger.error(f"✗ {year} {location} {session_name}: {e}")
 
-        column_mapping = {
-            'Time': 'session_time',
-            'AirTemp': 'air_temp',
-            'Humidity': 'humidity',
-            'Pressure': 'pressure',
-            'Rainfall': 'rainfall',
-            'TrackTemp': 'track_temp',
-            'WindDirection': 'wind_direction',
-            'WindSpeed': 'wind_speed' 
-        }
+    # ------------------------------------------------------------------
+    # Storage helpers
+    # ------------------------------------------------------------------
 
-        weather_df = weather_df.rename(columns=column_mapping)
+    def _store_session(self, session: dict, year: int) -> int:
+        with self.engine.connect() as conn:
+            result = conn.execute(text("""
+                INSERT INTO sessions (season, event_name, session_name, date, openf1_session_key)
+                VALUES (:season, :event_name, :session_name, :date, :openf1_session_key)
+                ON CONFLICT (season, event_name, session_name)
+                DO UPDATE SET openf1_session_key = EXCLUDED.openf1_session_key
+                RETURNING id
+            """), {
+                'season':              year,
+                'event_name':          session.get('location'),
+                'session_name':        session.get('session_name'),
+                'date':                session.get('date_start'),
+                'openf1_session_key':  session.get('session_key'),
+            })
+            session_id = result.fetchone()[0]
+            conn.commit()
+        return session_id
 
-        weather_df = self.process_dataframe_for_db(weather_df)
-        weather_df.to_sql('weather', self.engine, if_exists='append', index=False, method='multi')
-        
-        logger.info(f"Stored {len(weather_df)} weather records")
+    def _store_drivers(self, session_key: int, session_id: int) -> dict[int, str]:
+        """Store drivers and return {driver_number: abbreviation} map."""
+        drivers = openf1_get("drivers", {"session_key": session_key})
+        driver_map: dict[int, str] = {}
 
-    def _store_session_status(self, session, session_id: int):
-        """Store session status data"""
-        logger.info("Starting session status data processing")
+        with self.engine.connect() as conn:
+            for d in drivers:
+                num   = d.get('driver_number')
+                abbr  = d.get('name_acronym', str(num))
+                driver_map[num] = abbr
 
-        status_df = session.session_status.copy()
+                conn.execute(text("""
+                    INSERT INTO drivers (
+                        session_id, driver_number, broadcast_name, full_name,
+                        driver_id, team_name, team_color,
+                        first_name, last_name, headshot_url, country_code
+                    ) VALUES (
+                        :session_id, :driver_number, :broadcast_name, :full_name,
+                        :driver_id, :team_name, :team_color,
+                        :first_name, :last_name, :headshot_url, :country_code
+                    )
+                    ON CONFLICT (session_id, driver_number) DO NOTHING
+                """), {
+                    'session_id':     session_id,
+                    'driver_number':  str(num),
+                    'broadcast_name': d.get('broadcast_name'),
+                    'full_name':      d.get('full_name'),
+                    'driver_id':      abbr,
+                    'team_name':      d.get('team_name'),
+                    'team_color':     d.get('team_colour'),
+                    'first_name':     d.get('first_name'),
+                    'last_name':      d.get('last_name'),
+                    'headshot_url':   d.get('headshot_url'),
+                    'country_code':   d.get('country_code'),
+                })
+            conn.commit()
 
-        if status_df.empty:
-            logger.warning("No session status data available")
-            return
-        
-        status_df['session_id'] = session_id
+        logger.info(f"  Stored {len(drivers)} drivers")
+        return driver_map
 
-        column_mapping = {
-            'Time': 'session_time',
-            'Status': 'status'
-        }
+    def _store_laps(self, session_key: int, session_id: int, driver_map: dict[int, str]):
+        laps   = openf1_get("laps",   {"session_key": session_key})
+        stints = openf1_get("stints", {"session_key": session_key})
 
-        status_df = status_df.rename(columns=column_mapping)
+        # Build stint lookup: (driver_number, lap_number) → {compound, tyre_life, stint}
+        stint_lookup: dict[tuple, dict] = {}
+        for s in stints:
+            for lap_no in range(s.get('lap_start', 0), s.get('lap_end', 0) + 1):
+                key = (s.get('driver_number'), lap_no)
+                stint_lookup[key] = {
+                    'compound':   s.get('compound'),
+                    'tyre_life':  lap_no - s.get('lap_start', 0) + 1,
+                    'stint':      s.get('stint_number'),
+                    'fresh_tyre': s.get('lap_start') == lap_no,
+                }
 
-        status_df = self.process_dataframe_for_db(status_df)
-        status_df.to_sql('session_status', self.engine, if_exists='append', index=False, method='multi')
-        
-        logger.info(f"Stored session status")
+        with self.engine.connect() as conn:
+            for lap in laps:
+                num      = lap.get('driver_number')
+                lap_no   = lap.get('lap_number')
+                stint    = stint_lookup.get((num, lap_no), {})
+                driver_id = driver_map.get(num, str(num))
 
-    def _store_track_status(self, session, session_id: int):
-        """Store track status data"""
-        logger.info("Starting session status data processing")
+                conn.execute(text("""
+                    INSERT INTO laps (
+                        session_id, driver_id, lap_number,
+                        lap_time, sector1_time, sector2_time, sector3_time,
+                        speed_i1, speed_i2, speed_st,
+                        compound, tyre_life, fresh_tyre, stint,
+                        is_personal_best
+                    ) VALUES (
+                        :session_id, :driver_id, :lap_number,
+                        :lap_time, :sector1_time, :sector2_time, :sector3_time,
+                        :speed_i1, :speed_i2, :speed_st,
+                        :compound, :tyre_life, :fresh_tyre, :stint,
+                        :is_personal_best
+                    )
+                """), {
+                    'session_id':     session_id,
+                    'driver_id':      driver_id,
+                    'lap_number':     lap_no,
+                    'lap_time':       seconds_to_interval(lap.get('lap_duration')),
+                    'sector1_time':   seconds_to_interval(lap.get('duration_sector_1')),
+                    'sector2_time':   seconds_to_interval(lap.get('duration_sector_2')),
+                    'sector3_time':   seconds_to_interval(lap.get('duration_sector_3')),
+                    'speed_i1':       lap.get('i1_speed'),
+                    'speed_i2':       lap.get('i2_speed'),
+                    'speed_st':       lap.get('st_speed'),
+                    'compound':       stint.get('compound'),
+                    'tyre_life':      stint.get('tyre_life'),
+                    'fresh_tyre':     stint.get('fresh_tyre'),
+                    'stint':          stint.get('stint'),
+                    'is_personal_best': lap.get('is_pit_out_lap') is False and lap.get('lap_duration') is not None,
+                })
+            conn.commit()
 
-        track_df = session.track_status.copy()
+        logger.info(f"  Stored {len(laps)} laps")
 
-        if track_df.empty:
-            logger.warning("No track status data available")
-            return
-        
-        track_df['session_id'] = session_id
+    def _store_weather(self, session_key: int, session_id: int):
+        weather = openf1_get("weather", {"session_key": session_key})
 
-        column_mapping = {
-            'Time': 'session_time',
-            'Status': 'status',
-            'Message': 'message'
-        }
+        with self.engine.connect() as conn:
+            for w in weather:
+                conn.execute(text("""
+                    INSERT INTO weather (
+                        session_id, air_temp, humidity, pressure,
+                        rainfall, track_temp, wind_direction, wind_speed
+                    ) VALUES (
+                        :session_id, :air_temp, :humidity, :pressure,
+                        :rainfall, :track_temp, :wind_direction, :wind_speed
+                    )
+                """), {
+                    'session_id':    session_id,
+                    'air_temp':      w.get('air_temperature'),
+                    'humidity':      w.get('humidity'),
+                    'pressure':      w.get('pressure'),
+                    'rainfall':      w.get('rainfall'),
+                    'track_temp':    w.get('track_temperature'),
+                    'wind_direction': w.get('wind_direction'),
+                    'wind_speed':    w.get('wind_speed'),
+                })
+            conn.commit()
 
-        track_df = track_df.rename(columns=column_mapping)
+        logger.info(f"  Stored {len(weather)} weather records")
 
-        track_df = self.process_dataframe_for_db(track_df)
-        track_df.to_sql('track_status', self.engine, if_exists='append', index=False, method='multi')
-        
-        logger.info(f"Stored track status")
+    def _store_race_control(self, session_key: int, session_id: int):
+        messages = openf1_get("race_control", {"session_key": session_key})
 
-    def _store_race_control_messages(self, session, session_id: int):
-        """Store race control messages data"""
-        logger.info("Starting race control messages data processing")
+        with self.engine.connect() as conn:
+            for msg in messages:
+                conn.execute(text("""
+                    INSERT INTO race_control (
+                        session_id, category, message, flag,
+                        scope, sector, racing_number, lap
+                    ) VALUES (
+                        :session_id, :category, :message, :flag,
+                        :scope, :sector, :racing_number, :lap
+                    )
+                """), {
+                    'session_id':    session_id,
+                    'category':      msg.get('category'),
+                    'message':       msg.get('message'),
+                    'flag':          msg.get('flag'),
+                    'scope':         msg.get('scope'),
+                    'sector':        str(msg.get('sector')) if msg.get('sector') else None,
+                    'racing_number': str(msg.get('driver_number')) if msg.get('driver_number') else None,
+                    'lap':           msg.get('lap_number'),
+                })
+            conn.commit()
 
-        race_control_df = session.race_control_messages.copy()
+        logger.info(f"  Stored {len(messages)} race control messages")
 
-        if race_control_df.empty:
-            logger.warning("No race control messages data available")
-            return
-        
-        race_control_df['session_id'] = session_id
-
-        column_mapping = {
-            'Time': 'utc',
-            'Category': 'category',
-            'Message': 'message',
-            'Status': 'status',
-            'Flag': 'flag',
-            'Scope': 'scope',
-            'Sector': 'sector',
-            'RacingNumber': 'racing_number',
-            'Lap': 'lap'
-        }
-
-        race_control_df = race_control_df.rename(columns=column_mapping)
-
-        race_control_df = self.process_dataframe_for_db(race_control_df)
-        race_control_df.to_sql('race_control', self.engine, if_exists='append', index=False, method='multi')
-        
-        logger.info(f"Stored race control messages")
-
-    def _store_circuit_info(self, session, session_id: int):
-        """Store circuit info data"""
-        logger.info("Starting circuit info data processing")
-        
-        circuit_info = session.get_circuit_info()
-
-        all_markers = []
-        
-        column_mapping = {
-            'X': 'x_position',
-            'Y': 'y_position',
-            'Number': 'number',
-            'Letter': 'letter',
-            'Angle': 'angle',
-            'Distance': 'distance',
-            'Rotation': 'rotation'
-        }
-        
-        # Corners
-        if hasattr(circuit_info, 'corners') and not circuit_info.corners.empty:
-            corners_data = circuit_info.corners.copy()
-            corners_data['info_type'] = 'corners'  # Changed from marker_type to info_type to match schema
-            corners_data['session_id'] = session_id
-            
-            # Apply column mapping
-            corners_data = corners_data.rename(columns=column_mapping)
-            all_markers.append(corners_data)
-        
-        # Marshal lights
-        if hasattr(circuit_info, 'marshal_lights') and not circuit_info.marshal_lights.empty:
-            lights_data = circuit_info.marshal_lights.copy()
-            lights_data['info_type'] = 'marshal_lights'
-            lights_data['session_id'] = session_id
-            
-            # Apply column mapping
-            lights_data = lights_data.rename(columns=column_mapping)
-            all_markers.append(lights_data)
-        
-        # Marshal sectors
-        if hasattr(circuit_info, 'marshal_sectors') and not circuit_info.marshal_sectors.empty:
-            sectors_data = circuit_info.marshal_sectors.copy()
-            sectors_data['info_type'] = 'marshal_sectors'
-            sectors_data['session_id'] = session_id
-            
-            # Apply column mapping
-            sectors_data = sectors_data.rename(columns=column_mapping)
-            all_markers.append(sectors_data)
-        
-        # Combine all data
-        if all_markers:
-            combined_df = pd.concat(all_markers, ignore_index=True)
-            
-            # Select only columns that exist in both the dataframe and our table schema
-            expected_columns = ['session_id', 'info_type', 'x_position', 'y_position', 
-                            'number', 'letter', 'angle', 'distance', 'rotation']
-            existing_columns = [col for col in expected_columns if col in combined_df.columns]
-            combined_df = combined_df[existing_columns]
-            
-            # Process for database compatibility
-            combined_df = self.process_dataframe_for_db(combined_df)
-            combined_df.to_sql('circuit_info', self.engine, if_exists='append', index=False, method='multi')
-            logger.info(f"Stored {len(combined_df)} circuit info records")
-        else:
-            logger.warning("No circuit info data available")
 
 if __name__ == "__main__":
-    # Database configuration
-    db_config = {
-        'user': 'furkansina',
-        'host': 'localhost',
-        'port': '5432',
-        'database': 'data_2025',
-    }
+    pipeline = OpenF1Pipeline()
 
-    cache_dir = '/Users/furkansina/Library/Caches/fastf1' 
-    os.makedirs(cache_dir, exist_ok=True)
-    fastf1.Cache.enable_cache(cache_dir)
+    years         = [2024, 2025]
+    session_types = ['Qualifying', 'Race']
 
-    try:
-        # Initialize pipeline
-        pipeline = F1DataPipeline(db_config)
+    for year in years:
+        logger.info(f"=== Fetching {year} season ===")
+        pipeline.fetch_year(year, session_types)
 
-        years = range(2024,2025)
-        session_types = ['Q', 'R']
-
-
-        for year in years:
-
-            schedule = fastf1.get_event_schedule(year)
-            
-            for index, event in schedule.iterrows():
-                event_name = event["EventName"]
-                for session_type in session_types:
-                    try:
-                        pipeline.fetch_and_store_session(year, event_name, session_type)
-                        logger.info(f"✓ {year} {event_name} {session_type}")
-                    except Exception as e:
-                        logger.info(f"✗ {year} {event_name} {session_type}: {e}")
-                        continue
-                    
-                # Clear cache after each event (after all its sessions)
-                cache_path, cache_size = fastf1.Cache.get_cache_info()
-                if cache_path and cache_size > 0:
-                    logger.info(f"  Clearing cache after {event_name} ({cache_size/1024/1024:.1f} MB)...")
-                    fastf1.Cache.clear_cache(f'/Users/furkansina/Library/Caches/fastf1/{year}/', deep=True) # change to your own cache path
-
-
-
-    
-    finally:
-        print("\nFinal cleanup...")
-        fastf1.Cache.clear_cache('/Users/furkansina/Library/Caches/fastf1/2025/', deep=True)
-        print("Scraping complete!")
-
-
+    print("Fetch complete!")

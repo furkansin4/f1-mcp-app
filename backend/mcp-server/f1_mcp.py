@@ -42,7 +42,7 @@ def _session_openf1_key(session_id: int) -> Optional[int]:
     conn = create_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT season, event_name, session_name FROM sessions WHERE id = %s", (session_id,))
+            cur.execute("SELECT season, openf1_session_key FROM sessions WHERE id = %s", (session_id,))
             row = cur.fetchone()
     finally:
         conn.close()
@@ -50,7 +50,7 @@ def _session_openf1_key(session_id: int) -> Optional[int]:
     if not row:
         return None
 
-    session_key = openf1.get_session_key(row['season'], row['event_name'], row['session_name'])
+    session_key = row.get('openf1_session_key')
     if session_key:
         _cache.set(ck, session_key, ttl=_cache.ttl_for_year(row['season']))
     return session_key
