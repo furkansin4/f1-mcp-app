@@ -1,3 +1,8 @@
+-- ============================================================
+-- F1 MCP App — Database Schema
+-- Telemetry is served live from OpenF1 API; not stored here.
+-- ============================================================
+
 CREATE TABLE IF NOT EXISTS sessions (
     id SERIAL PRIMARY KEY,
     season INTEGER NOT NULL,
@@ -20,8 +25,8 @@ CREATE TABLE IF NOT EXISTS drivers (
     driver_number VARCHAR(10) NOT NULL,
     broadcast_name VARCHAR(100),
     full_name VARCHAR(100),
-    driver_id VARCHAR(10), -- abbrevation
-    driver_name VARCHAR(50), -- driver_id
+    driver_id VARCHAR(10),
+    driver_name VARCHAR(50),
     team_name VARCHAR(100),
     team_color VARCHAR(20),
     team_id VARCHAR(50),
@@ -46,7 +51,7 @@ CREATE TABLE IF NOT EXISTS drivers (
 CREATE TABLE IF NOT EXISTS laps (
     id SERIAL PRIMARY KEY,
     session_id INTEGER REFERENCES sessions(id),
-    driver_id VARCHAR(10) NOT NULL, -- driver_number
+    driver_id VARCHAR(10) NOT NULL,
     lap_number FLOAT,
     lap_time INTERVAL,
     lap_start_time INTERVAL,
@@ -76,33 +81,6 @@ CREATE TABLE IF NOT EXISTS laps (
     fastf1_generated BOOLEAN,
     is_accurate BOOLEAN,
     session_time INTERVAL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS telemetry (
-    id SERIAL PRIMARY KEY,
-    session_id INTEGER REFERENCES sessions(id),
-    driver_id VARCHAR(10) NOT NULL, -- driver_number
-    driver_number VARCHAR(10) NOT NULL,
-    lap_number FLOAT,
-    session_time INTERVAL,
-    date_time TIMESTAMP,
-    time_elapsed INTERVAL,
-    speed FLOAT,
-    rpm FLOAT,
-    n_gear INTEGER,
-    throttle FLOAT,
-    brake BOOLEAN,
-    drs INTEGER,
-    x_position FLOAT,
-    y_position FLOAT,
-    z_position FLOAT,
-    status VARCHAR(20),
-    source VARCHAR(20),
-    distance FLOAT,
-    relative_distance FLOAT,
-    driver_ahead VARCHAR(10),
-    distance_to_driver_ahead FLOAT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -156,38 +134,59 @@ CREATE TABLE IF NOT EXISTS race_control (
 CREATE TABLE IF NOT EXISTS circuit_info (
     id SERIAL PRIMARY KEY,
     session_id INTEGER REFERENCES sessions(id),
-    info_type VARCHAR(50), -- 'corners', 'marshal_lights', 'marshal_sectors'
+    info_type VARCHAR(50),
     x_position FLOAT,
     y_position FLOAT,
     number INTEGER,
     letter VARCHAR(10),
     angle FLOAT,
     distance FLOAT,
-    rotation FLOAT, -- Only for circuit rotation info
+    rotation FLOAT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- ============================================================
+-- User & conversation tables
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    plan VARCHAR(20) DEFAULT 'free'
+);
 
 CREATE TABLE IF NOT EXISTS conversations (
     id SERIAL PRIMARY KEY,
-	title TEXT,
-	created_at TIMESTAMP
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
 
 CREATE TABLE IF NOT EXISTS messages (
     id SERIAL PRIMARY KEY,
-	conversation_id INTEGER REFERENCES conversations(id),
-	message TEXT,
-	role VARCHAR(20),
-	created_at TIMESTAMP
+    conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+    message TEXT,
+    role VARCHAR(20),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS tool_executions (
     id SERIAL PRIMARY KEY,
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     tool_name VARCHAR(255) NOT NULL,
     tool_request JSONB,
     tool_response JSONB,
-    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (now() at time zone 'utc')
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ============================================================
+-- Indexes
+-- ============================================================
+
+CREATE INDEX IF NOT EXISTS idx_laps_session_driver    ON laps(session_id, driver_id);
+CREATE INDEX IF NOT EXISTS idx_drivers_session        ON drivers(session_id);
+CREATE INDEX IF NOT EXISTS idx_weather_session        ON weather(session_id);
+CREATE INDEX IF NOT EXISTS idx_race_control_session   ON race_control(session_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_user     ON conversations(user_id);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation  ON messages(conversation_id);
