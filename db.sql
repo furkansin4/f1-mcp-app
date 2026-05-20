@@ -127,20 +127,6 @@ CREATE TABLE IF NOT EXISTS race_control (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS circuit_info (
-    id SERIAL PRIMARY KEY,
-    session_id INTEGER REFERENCES sessions(id),
-    info_type VARCHAR(50),
-    x_position FLOAT,
-    y_position FLOAT,
-    number INTEGER,
-    letter VARCHAR(10),
-    angle FLOAT,
-    distance FLOAT,
-    rotation FLOAT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
 -- ============================================================
 -- User & conversation tables
 -- ============================================================
