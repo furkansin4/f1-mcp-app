@@ -8,7 +8,9 @@ import cache as _cache
 
 from fastmcp import FastMCP
 import psycopg2
+from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
 from typing import List, Optional
 import logging
 from dotenv import load_dotenv
@@ -22,14 +24,32 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def create_db_connection():
-    return psycopg2.connect(
-        host=os.getenv('DB_HOST'),
-        database=os.getenv('DB_NAME'),
-        user=os.getenv('DB_USER'),
-        password=os.getenv('DB_PASSWORD', ''),
-        port=os.getenv('DB_PORT', '5432'),
-    )
+_pool: pg_pool.ThreadedConnectionPool = None
+
+
+def _get_pool() -> pg_pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = pg_pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=10,
+            host=os.getenv('DB_HOST'),
+            database=os.getenv('DB_NAME'),
+            user=os.getenv('DB_USER'),
+            password=os.getenv('DB_PASSWORD', ''),
+            port=os.getenv('DB_PORT', '5432'),
+        )
+    return _pool
+
+
+@contextmanager
+def get_conn():
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+    finally:
+        pool.putconn(conn)
 
 
 def _session_openf1_key(session_id: int) -> Optional[int]:
@@ -39,13 +59,10 @@ def _session_openf1_key(session_id: int) -> Optional[int]:
     if cached is not None:
         return cached
 
-    conn = create_db_connection()
-    try:
+    with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT year, session_key FROM sessions WHERE id = %s", (session_id,))
             row = cur.fetchone()
-    finally:
-        conn.close()
 
     if not row:
         return None
@@ -63,16 +80,13 @@ def _driver_number(session_id: int, name_acronym: str) -> Optional[str]:
     if cached is not None:
         return cached
 
-    conn = create_db_connection()
-    try:
+    with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 "SELECT driver_number FROM drivers WHERE session_id = %s AND name_acronym = %s LIMIT 1",
                 (session_id, name_acronym),
             )
             row = cur.fetchone()
-    finally:
-        conn.close()
 
     number = str(row['driver_number']) if row else None
     if number:
@@ -87,203 +101,187 @@ def _driver_number(session_id: int, name_acronym: str) -> Optional[str]:
 @mcp.tool
 def get_session_id(event_name: str, year: int, session_name: str = None):
     """Get relevant session id for further tools. event_name can be city (Melbourne), country (Australia), or GP name (Australian Grand Prix)."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            pattern = f"%{event_name.lower()}%"
-            en = event_name.lower()
-            cur.execute(
-                "SELECT id, session_name, location, country_name FROM sessions "
-                "WHERE (LOWER(location) LIKE %s OR LOWER(country_name) LIKE %s "
-                "OR %s LIKE CONCAT('%%', LOWER(location), '%%') "
-                "OR %s LIKE CONCAT('%%', LOWER(country_name), '%%')) AND year = %s",
-                (pattern, pattern, en, en, year),
-            )
-            results = cur.fetchall()
-            if session_name:
-                filtered = [r for r in results if session_name.lower() in r['session_name'].lower()]
-                return filtered if filtered else results
-            return results
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                pattern = f"%{event_name.lower()}%"
+                en = event_name.lower()
+                cur.execute(
+                    "SELECT id, session_name, location, country_name FROM sessions "
+                    "WHERE (LOWER(location) LIKE %s OR LOWER(country_name) LIKE %s "
+                    "OR %s LIKE CONCAT('%%', LOWER(location), '%%') "
+                    "OR %s LIKE CONCAT('%%', LOWER(country_name), '%%')) AND year = %s",
+                    (pattern, pattern, en, en, year),
+                )
+                results = cur.fetchall()
+                if session_name:
+                    filtered = [r for r in results if session_name.lower() in r['session_name'].lower()]
+                    return filtered if filtered else results
+                return results
     except Exception as e:
         logger.error(f"Database error in get_session_id: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_fastest_lap_and_sector_comparison(session_id: int, name_acronym: str = None):
     """Get fastest lap and sector times per driver. Pass name_acronym to filter to one driver."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if name_acronym:
-                cur.execute("""
-                    SELECT name_acronym, lap_number, lap_duration,
-                           duration_sector_1, duration_sector_2, duration_sector_3,
-                           i1_speed, i2_speed, st_speed, compound
-                    FROM laps WHERE session_id = %s AND name_acronym = %s
-                    ORDER BY lap_duration ASC NULLS LAST LIMIT 1
-                """, (session_id, name_acronym))
-            else:
-                cur.execute("""
-                    SELECT DISTINCT ON (name_acronym)
-                        name_acronym, lap_number, lap_duration,
-                        duration_sector_1, duration_sector_2, duration_sector_3,
-                        i1_speed, i2_speed, st_speed, compound
-                    FROM laps WHERE session_id = %s
-                    ORDER BY name_acronym, lap_duration ASC NULLS LAST
-                """, (session_id,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if name_acronym:
+                    cur.execute("""
+                        SELECT name_acronym, lap_number, lap_duration,
+                               duration_sector_1, duration_sector_2, duration_sector_3,
+                               i1_speed, i2_speed, st_speed, compound
+                        FROM laps WHERE session_id = %s AND name_acronym = %s
+                        ORDER BY lap_duration ASC NULLS LAST LIMIT 1
+                    """, (session_id, name_acronym))
+                else:
+                    cur.execute("""
+                        SELECT DISTINCT ON (name_acronym)
+                            name_acronym, lap_number, lap_duration,
+                            duration_sector_1, duration_sector_2, duration_sector_3,
+                            i1_speed, i2_speed, st_speed, compound
+                        FROM laps WHERE session_id = %s
+                        ORDER BY name_acronym, lap_duration ASC NULLS LAST
+                    """, (session_id,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_fastest_lap_and_sector_comparison: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_top_speed_session(session_id: int):
     """Get each driver's highest recorded straight-line speed in a session."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT DISTINCT ON (name_acronym)
-                    name_acronym, lap_number, st_speed, i1_speed, i2_speed, compound
-                FROM laps WHERE session_id = %s AND st_speed IS NOT NULL
-                ORDER BY name_acronym, st_speed DESC
-            """, (session_id,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT DISTINCT ON (name_acronym)
+                        name_acronym, lap_number, st_speed, i1_speed, i2_speed, compound
+                    FROM laps WHERE session_id = %s AND st_speed IS NOT NULL
+                    ORDER BY name_acronym, st_speed DESC
+                """, (session_id,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_top_speed_session: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_driver_results(session_id: int):
     """Get all driver results (position, grid, status, dnf) for a session."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT driver_number, name_acronym, full_name, team_name, team_colour,
-                       position, grid_position, dnf, status
-                FROM drivers WHERE session_id = %s ORDER BY position NULLS LAST
-            """, (session_id,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT driver_number, name_acronym, full_name, team_name, team_colour,
+                           position, grid_position, dnf, status
+                    FROM drivers WHERE session_id = %s ORDER BY position NULLS LAST
+                """, (session_id,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_driver_results: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_laps(session_id: int, name_acronym: str = None):
     """Get lap-by-lap data. Pass name_acronym to filter to one driver."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if name_acronym:
-                cur.execute("""
-                    SELECT name_acronym, lap_number, lap_duration, date_start,
-                           duration_sector_1, duration_sector_2, duration_sector_3,
-                           i1_speed, i2_speed, st_speed, is_pit_out_lap,
-                           compound, tyre_age_at_start, stint_number, fresh_tyre
-                    FROM laps WHERE session_id = %s AND name_acronym = %s
-                    ORDER BY lap_number
-                """, (session_id, name_acronym))
-            else:
-                cur.execute("""
-                    SELECT name_acronym, lap_number, lap_duration, date_start,
-                           duration_sector_1, duration_sector_2, duration_sector_3,
-                           i1_speed, i2_speed, st_speed, is_pit_out_lap,
-                           compound, tyre_age_at_start, stint_number, fresh_tyre
-                    FROM laps WHERE session_id = %s ORDER BY lap_number
-                """, (session_id,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if name_acronym:
+                    cur.execute("""
+                        SELECT name_acronym, lap_number, lap_duration, date_start,
+                               duration_sector_1, duration_sector_2, duration_sector_3,
+                               i1_speed, i2_speed, st_speed, is_pit_out_lap,
+                               compound, tyre_age_at_start, stint_number, fresh_tyre
+                        FROM laps WHERE session_id = %s AND name_acronym = %s
+                        ORDER BY lap_number
+                    """, (session_id, name_acronym))
+                else:
+                    cur.execute("""
+                        SELECT name_acronym, lap_number, lap_duration, date_start,
+                               duration_sector_1, duration_sector_2, duration_sector_3,
+                               i1_speed, i2_speed, st_speed, is_pit_out_lap,
+                               compound, tyre_age_at_start, stint_number, fresh_tyre
+                        FROM laps WHERE session_id = %s ORDER BY lap_number
+                    """, (session_id,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_laps: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_weekend_weather(session_id: int):
     """Get weather data for a session."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT date, air_temperature, humidity, pressure,
-                       rainfall, track_temperature, wind_direction, wind_speed
-                FROM weather WHERE session_id = %s ORDER BY date
-            """, (session_id,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT date, air_temperature, humidity, pressure,
+                           rainfall, track_temperature, wind_direction, wind_speed
+                    FROM weather WHERE session_id = %s ORDER BY date
+                """, (session_id,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_weekend_weather: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_tyre_strategies(session_id: int):
     """Get tyre compound usage per driver in a session."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT name_acronym, compound, stint_number,
-                       COUNT(*) AS laps_on_compound,
-                       MIN(lap_number) AS first_lap,
-                       MAX(lap_number) AS last_lap,
-                       MIN(tyre_age_at_start) AS tyre_age_at_start
-                FROM laps WHERE session_id = %s AND compound IS NOT NULL
-                GROUP BY name_acronym, compound, stint_number
-                ORDER BY name_acronym, first_lap
-            """, (session_id,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT name_acronym, compound, stint_number,
+                           COUNT(*) AS laps_on_compound,
+                           MIN(lap_number) AS first_lap,
+                           MAX(lap_number) AS last_lap,
+                           MIN(tyre_age_at_start) AS tyre_age_at_start
+                    FROM laps WHERE session_id = %s AND compound IS NOT NULL
+                    GROUP BY name_acronym, compound, stint_number
+                    ORDER BY name_acronym, first_lap
+                """, (session_id,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_tyre_strategies: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_weather_impact_laps(session_id: int, name_acronym: str):
     """Get lap-by-lap data with closest weather snapshot for a specific driver."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT l.name_acronym, l.lap_number, l.lap_duration,
-                       l.duration_sector_1, l.duration_sector_2, l.duration_sector_3,
-                       l.compound, l.date_start,
-                       w.air_temperature, w.humidity, w.rainfall,
-                       w.track_temperature, w.wind_speed
-                FROM laps l
-                LEFT JOIN LATERAL (
-                    SELECT air_temperature, humidity, rainfall,
-                           track_temperature, wind_speed
-                    FROM weather w
-                    WHERE w.session_id = l.session_id AND w.date <= l.date_start
-                    ORDER BY w.date DESC LIMIT 1
-                ) w ON true
-                WHERE l.session_id = %s AND l.name_acronym = %s
-                ORDER BY l.lap_number
-            """, (session_id, name_acronym))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT l.name_acronym, l.lap_number, l.lap_duration,
+                           l.duration_sector_1, l.duration_sector_2, l.duration_sector_3,
+                           l.compound, l.date_start,
+                           w.air_temperature, w.humidity, w.rainfall,
+                           w.track_temperature, w.wind_speed
+                    FROM laps l
+                    LEFT JOIN LATERAL (
+                        SELECT air_temperature, humidity, rainfall,
+                               track_temperature, wind_speed
+                        FROM weather w
+                        WHERE w.session_id = l.session_id AND w.date <= l.date_start
+                        ORDER BY w.date DESC LIMIT 1
+                    ) w ON true
+                    WHERE l.session_id = %s AND l.name_acronym = %s
+                    ORDER BY l.lap_number
+                """, (session_id, name_acronym))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_weather_impact_laps: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
@@ -294,49 +292,47 @@ def get_position_changes(season: int, session_id: int = None, name_acronym: str 
     - season + name_acronym: driver's season history.
     - season only: season-wide summary.
     """
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if session_id is not None:
-                cur.execute("""
-                    SELECT s.year, s.location, d.driver_number, d.full_name, d.name_acronym,
-                           d.team_name, d.grid_position, d.position,
-                           (d.grid_position - d.position) AS position_change, d.status, d.dnf
-                    FROM drivers d JOIN sessions s ON d.session_id = s.id
-                    WHERE d.session_id = %s
-                      AND d.position IS NOT NULL AND d.grid_position IS NOT NULL
-                    ORDER BY (d.grid_position - d.position) DESC
-                """, (session_id,))
-            elif name_acronym is not None:
-                cur.execute("""
-                    SELECT s.location, s.date_start, d.name_acronym, d.full_name,
-                           d.team_name, d.grid_position, d.position,
-                           (d.grid_position - d.position) AS position_change, d.status
-                    FROM drivers d JOIN sessions s ON d.session_id = s.id
-                    WHERE s.year = %s AND s.session_name = 'Race'
-                      AND d.name_acronym = %s
-                      AND d.position IS NOT NULL AND d.grid_position IS NOT NULL
-                    ORDER BY s.date_start
-                """, (season, name_acronym))
-            else:
-                cur.execute("""
-                    SELECT d.name_acronym, d.full_name, d.team_name,
-                           COUNT(*) AS races_counted,
-                           SUM(d.grid_position - d.position) AS total_position_change,
-                           AVG(d.grid_position - d.position) AS avg_position_change,
-                           MAX(d.grid_position - d.position) AS best_single_gain
-                    FROM drivers d JOIN sessions s ON d.session_id = s.id
-                    WHERE s.year = %s AND s.session_name = 'Race'
-                      AND d.position IS NOT NULL AND d.grid_position IS NOT NULL
-                    GROUP BY d.name_acronym, d.full_name, d.team_name
-                    ORDER BY total_position_change DESC
-                """, (season,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if session_id is not None:
+                    cur.execute("""
+                        SELECT s.year, s.location, d.driver_number, d.full_name, d.name_acronym,
+                               d.team_name, d.grid_position, d.position,
+                               (d.grid_position - d.position) AS position_change, d.status, d.dnf
+                        FROM drivers d JOIN sessions s ON d.session_id = s.id
+                        WHERE d.session_id = %s
+                          AND d.position IS NOT NULL AND d.grid_position IS NOT NULL
+                        ORDER BY (d.grid_position - d.position) DESC
+                    """, (session_id,))
+                elif name_acronym is not None:
+                    cur.execute("""
+                        SELECT s.location, s.date_start, d.name_acronym, d.full_name,
+                               d.team_name, d.grid_position, d.position,
+                               (d.grid_position - d.position) AS position_change, d.status
+                        FROM drivers d JOIN sessions s ON d.session_id = s.id
+                        WHERE s.year = %s AND s.session_name = 'Race'
+                          AND d.name_acronym = %s
+                          AND d.position IS NOT NULL AND d.grid_position IS NOT NULL
+                        ORDER BY s.date_start
+                    """, (season, name_acronym))
+                else:
+                    cur.execute("""
+                        SELECT d.name_acronym, d.full_name, d.team_name,
+                               COUNT(*) AS races_counted,
+                               SUM(d.grid_position - d.position) AS total_position_change,
+                               AVG(d.grid_position - d.position) AS avg_position_change,
+                               MAX(d.grid_position - d.position) AS best_single_gain
+                        FROM drivers d JOIN sessions s ON d.session_id = s.id
+                        WHERE s.year = %s AND s.session_name = 'Race'
+                          AND d.position IS NOT NULL AND d.grid_position IS NOT NULL
+                        GROUP BY d.name_acronym, d.full_name, d.team_name
+                        ORDER BY total_position_change DESC
+                    """, (season,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error("Database error in get_position_changes:\n" + traceback.format_exc())
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
@@ -347,133 +343,123 @@ def get_dnf(season: int, session_id: int = None, name_acronym: str = None):
     - season + name_acronym: driver's DNF history.
     - season only: season-wide DNF stats.
     """
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if session_id is not None:
-                cur.execute("""
-                    SELECT s.year, s.location, d.driver_number, d.full_name, d.name_acronym,
-                           d.team_name, d.grid_position, d.position, d.status
-                    FROM drivers d JOIN sessions s ON d.session_id = s.id
-                    WHERE d.session_id = %s AND d.dnf = TRUE
-                """, (session_id,))
-            elif name_acronym is not None:
-                cur.execute("""
-                    SELECT s.location, s.date_start, d.name_acronym, d.full_name,
-                           d.team_name, d.grid_position, d.position, d.status
-                    FROM drivers d JOIN sessions s ON d.session_id = s.id
-                    WHERE s.year = %s AND s.session_name = 'Race'
-                      AND d.name_acronym = %s AND d.dnf = TRUE
-                    ORDER BY s.date_start
-                """, (season, name_acronym))
-            else:
-                cur.execute("""
-                    SELECT d.name_acronym, d.full_name, d.team_name,
-                           COUNT(*) AS total_races,
-                           SUM(CASE WHEN d.dnf THEN 1 ELSE 0 END) AS dnf_count,
-                           SUM(CASE WHEN NOT d.dnf THEN 1 ELSE 0 END) AS finished_races
-                    FROM drivers d JOIN sessions s ON d.session_id = s.id
-                    WHERE s.year = %s AND s.session_name = 'Race'
-                    GROUP BY d.name_acronym, d.full_name, d.team_name
-                    ORDER BY dnf_count DESC
-                """, (season,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if session_id is not None:
+                    cur.execute("""
+                        SELECT s.year, s.location, d.driver_number, d.full_name, d.name_acronym,
+                               d.team_name, d.grid_position, d.position, d.status
+                        FROM drivers d JOIN sessions s ON d.session_id = s.id
+                        WHERE d.session_id = %s AND d.dnf = TRUE
+                    """, (session_id,))
+                elif name_acronym is not None:
+                    cur.execute("""
+                        SELECT s.location, s.date_start, d.name_acronym, d.full_name,
+                               d.team_name, d.grid_position, d.position, d.status
+                        FROM drivers d JOIN sessions s ON d.session_id = s.id
+                        WHERE s.year = %s AND s.session_name = 'Race'
+                          AND d.name_acronym = %s AND d.dnf = TRUE
+                        ORDER BY s.date_start
+                    """, (season, name_acronym))
+                else:
+                    cur.execute("""
+                        SELECT d.name_acronym, d.full_name, d.team_name,
+                               COUNT(*) AS total_races,
+                               SUM(CASE WHEN d.dnf THEN 1 ELSE 0 END) AS dnf_count,
+                               SUM(CASE WHEN NOT d.dnf THEN 1 ELSE 0 END) AS finished_races
+                        FROM drivers d JOIN sessions s ON d.session_id = s.id
+                        WHERE s.year = %s AND s.session_name = 'Race'
+                        GROUP BY d.name_acronym, d.full_name, d.team_name
+                        ORDER BY dnf_count DESC
+                    """, (season,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error("Database error in get_dnf:\n" + traceback.format_exc())
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_race_control_messages(session_id: int):
     """Get race control messages (flags, safety car, etc.) for a session."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT date, category, message, flag, scope,
-                       sector, driver_number, lap_number, qualifying_phase
-                FROM race_control WHERE session_id = %s
-                ORDER BY date
-            """, (session_id,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT date, category, message, flag, scope,
+                           sector, driver_number, lap_number, qualifying_phase
+                    FROM race_control WHERE session_id = %s
+                    ORDER BY date
+                """, (session_id,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_race_control_messages: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_rainy_sessions(season: int):
     """Get sessions where rainfall was recorded."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT DISTINCT ON (s.location)
-                    s.year, s.location, s.session_name, s.date_start,
-                    w.air_temperature, w.humidity, w.track_temperature, w.wind_speed
-                FROM weather w JOIN sessions s ON w.session_id = s.id
-                WHERE w.rainfall = true AND s.year = %s
-                ORDER BY s.location, s.date_start
-            """, (season,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT DISTINCT ON (s.location)
+                        s.year, s.location, s.session_name, s.date_start,
+                        w.air_temperature, w.humidity, w.track_temperature, w.wind_speed
+                    FROM weather w JOIN sessions s ON w.session_id = s.id
+                    WHERE w.rainfall = true AND s.year = %s
+                    ORDER BY s.location, s.date_start
+                """, (season,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_rainy_sessions: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_pit_stops(session_id: int, name_acronym: str = None):
     """Get pit stop data for a session. Pass name_acronym to filter to one driver."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if name_acronym:
-                cur.execute("""
-                    SELECT name_acronym, lap_number, stop_duration, lane_duration, date
-                    FROM pits WHERE session_id = %s AND name_acronym = %s ORDER BY lap_number
-                """, (session_id, name_acronym))
-            else:
-                cur.execute("""
-                    SELECT name_acronym, lap_number, stop_duration, lane_duration, date
-                    FROM pits WHERE session_id = %s ORDER BY lap_number
-                """, (session_id,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if name_acronym:
+                    cur.execute("""
+                        SELECT name_acronym, lap_number, stop_duration, lane_duration, date
+                        FROM pits WHERE session_id = %s AND name_acronym = %s ORDER BY lap_number
+                    """, (session_id, name_acronym))
+                else:
+                    cur.execute("""
+                        SELECT name_acronym, lap_number, stop_duration, lane_duration, date
+                        FROM pits WHERE session_id = %s ORDER BY lap_number
+                    """, (session_id,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_pit_stops: {e}")
         return []
-    finally:
-        conn.close()
 
 
 @mcp.tool
 def get_overtakes(session_id: int):
     """Get overtake events with driver names for a session."""
-    conn = create_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT o.date, o.position,
-                       d1.name_acronym AS overtaking_driver, d1.team_name AS overtaking_team,
-                       d2.name_acronym AS overtaken_driver,  d2.team_name AS overtaken_team
-                FROM overtakes o
-                LEFT JOIN drivers d1 ON d1.session_id = o.session_id
-                                     AND d1.driver_number = o.overtaking_driver_number
-                LEFT JOIN drivers d2 ON d2.session_id = o.session_id
-                                     AND d2.driver_number = o.overtaken_driver_number
-                WHERE o.session_id = %s ORDER BY o.date
-            """, (session_id,))
-            return [dict(r) for r in cur.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT o.date, o.position,
+                           d1.name_acronym AS overtaking_driver, d1.team_name AS overtaking_team,
+                           d2.name_acronym AS overtaken_driver,  d2.team_name AS overtaken_team
+                    FROM overtakes o
+                    LEFT JOIN drivers d1 ON d1.session_id = o.session_id
+                                         AND d1.driver_number = o.overtaking_driver_number
+                    LEFT JOIN drivers d2 ON d2.session_id = o.session_id
+                                         AND d2.driver_number = o.overtaken_driver_number
+                    WHERE o.session_id = %s ORDER BY o.date
+                """, (session_id,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.error(f"Database error in get_overtakes: {e}")
         return []
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -526,14 +512,11 @@ def get_telemetry(session_id: int, driver_ids: List[str], lap_number: int = None
         for point in data:
             point["name_acronym"] = name_acronym
 
-        conn = create_db_connection()
-        try:
+        with get_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT year FROM sessions WHERE id = %s", (session_id,))
                 row = cur.fetchone()
                 ttl = _cache.ttl_for_year(row['year']) if row else _cache.CURRENT_TTL
-        finally:
-            conn.close()
 
         _cache.set(ck, data, ttl=ttl)
         results.extend(data)
@@ -569,14 +552,11 @@ def get_corner_analysis(session_id: int, name_acronym: str):
     min_len = min(len(car_data), len(location_data))
     merged  = [{**car_data[i], **location_data[i]} for i in range(min_len)]
 
-    conn = create_db_connection()
-    try:
+    with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT year FROM sessions WHERE id = %s", (session_id,))
             row = cur.fetchone()
             ttl = _cache.ttl_for_year(row['year']) if row else _cache.CURRENT_TTL
-    finally:
-        conn.close()
 
     _cache.set(ck, merged, ttl=ttl)
     return merged
@@ -605,14 +585,11 @@ def get_intervals(session_id: int, name_acronym: str = None):
 
     data = openf1.get("intervals", params)
 
-    conn = create_db_connection()
-    try:
+    with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT year FROM sessions WHERE id = %s", (session_id,))
             row = cur.fetchone()
             ttl = _cache.ttl_for_year(row['year']) if row else _cache.CURRENT_TTL
-    finally:
-        conn.close()
 
     _cache.set(ck, data, ttl=ttl)
     return data

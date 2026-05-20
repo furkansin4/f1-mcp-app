@@ -15,14 +15,12 @@ import json
 
 load_dotenv()
 
-def create_db_connection():
-    """Create SQLAlchemy engine for PostgreSQL connection"""
+def _build_engine():
     user = os.getenv('DB_USER')
     password = os.getenv('DB_PASSWORD', '')
     host = os.getenv('DB_HOST')
     port = os.getenv('DB_PORT', '5432')
     database = os.getenv('DB_NAME')
-
     connection_string = f"postgresql://{user}:{password}@{host}:{port}/{database}"
     return create_engine(
         connection_string,
@@ -30,6 +28,8 @@ def create_db_connection():
         pool_size=5,
         max_overflow=10,
     )
+
+_engine = _build_engine()
 
 
 def truncate_tool_response(tool_response_data, max_length=250):
@@ -133,10 +133,8 @@ async def root():
 @app.post("/chat")
 async def process_query(request: ChatRequest):
     """Process a query and return the response"""
-    db = create_db_connection()
-    
     try:
-        with db.connect() as conn:
+        with _engine.connect() as conn:
             if request.conversation_id is not None and request.conversation_id > 0:
                 conversation_id = request.conversation_id
 
@@ -261,8 +259,7 @@ async def get_current_model():
 async def get_recents():
     """Get recent chat history"""
     try:
-        db = create_db_connection()
-        with db.connect() as conn:
+        with _engine.connect() as conn:
             result = conn.execute(text("SELECT id, title, created_at FROM conversations ORDER BY created_at DESC"))
             conversations = result.fetchall()
             return [
@@ -281,8 +278,7 @@ async def get_recents():
 async def get_conversation(conversation_id: int):
     """Get a conversation by id"""
     try:
-        db = create_db_connection()
-        with db.connect() as conn:
+        with _engine.connect() as conn:
             result = conn.execute(text("SELECT id, title, created_at FROM conversations WHERE id = :conversation_id"), {"conversation_id": conversation_id})
             conversation = result.fetchone()
             if conversation:
@@ -301,8 +297,7 @@ async def get_conversation(conversation_id: int):
 async def update_conversation_title(conversation_id: int, request: UpdateTitleRequest):
     """Update the title of a conversation"""
     try:
-        db = create_db_connection()
-        with db.connect() as conn:
+        with _engine.connect() as conn:
             # Verify the conversation exists
             result = conn.execute(text("SELECT id FROM conversations WHERE id = :conversation_id"), {"conversation_id": conversation_id})
             if not result.fetchone():
@@ -323,12 +318,11 @@ async def update_conversation_title(conversation_id: int, request: UpdateTitleRe
 async def delete_conversation(conversation_id: int):
     """Delete a conversation by id"""
     try:
-        db = create_db_connection()
-        with db.connect() as conn:
+        with _engine.connect() as conn:
             result = conn.execute(text("SELECT id FROM conversations WHERE id = :conversation_id"), {"conversation_id": conversation_id})
             if not result.fetchone():
                 raise HTTPException(status_code=404, detail="Conversation not found")
-            
+
             conn.execute(text("DELETE FROM tool_executions WHERE conversation_id = :conversation_id"), {"conversation_id": conversation_id})
             
             conn.execute(text("DELETE FROM messages WHERE conversation_id = :conversation_id"), {"conversation_id": conversation_id})
@@ -347,8 +341,7 @@ async def delete_conversation(conversation_id: int):
 async def get_conversation_messages(conversation_id: int):
     """Get all messages for a conversation"""
     try:
-        db = create_db_connection()
-        with db.connect() as conn:
+        with _engine.connect() as conn:
             result = conn.execute(text("""
                 SELECT id, conversation_id, message, role, created_at FROM messages WHERE conversation_id = :conversation_id
                 ORDER BY created_at ASC
@@ -395,8 +388,7 @@ async def get_tools():
 async def get_conversation_tools(conversation_id: int):
     """Get all tool executions for a conversation"""
     try:
-        db = create_db_connection()
-        with db.connect() as conn:
+        with _engine.connect() as conn:
             result = conn.execute(text("""
                 SELECT id, conversation_id, tool_name, tool_request, tool_response, created_at 
                 FROM tool_executions 
