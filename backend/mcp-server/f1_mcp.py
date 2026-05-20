@@ -11,6 +11,8 @@ import psycopg2
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
+from datetime import datetime, timedelta
+from bisect import bisect_left
 from typing import List, Optional
 import logging
 from dotenv import load_dotenv
@@ -463,6 +465,54 @@ def get_overtakes(session_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_openf1_date(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def _merge_by_timestamp(primary: list, secondary: list) -> list:
+    """Join two OpenF1 data lists on nearest timestamp.
+
+    Each point must have a 'date' field. For every point in primary we find
+    the single closest point in secondary and merge the two dicts (primary
+    keys win on conflict).  Falls back to index-based merge if date parsing
+    fails.
+    """
+    if not primary or not secondary:
+        return primary or []
+
+    try:
+        sec_sorted = sorted(secondary, key=lambda x: _parse_openf1_date(x["date"]))
+        sec_times  = [_parse_openf1_date(x["date"]) for x in sec_sorted]
+    except (KeyError, ValueError):
+        min_len = min(len(primary), len(secondary))
+        return [{**secondary[i], **primary[i]} for i in range(min_len)]
+
+    merged = []
+    for point in primary:
+        try:
+            t = _parse_openf1_date(point["date"])
+        except (KeyError, ValueError):
+            continue
+
+        idx = bisect_left(sec_times, t)
+        if idx == 0:
+            nearest = sec_sorted[0]
+        elif idx >= len(sec_sorted):
+            nearest = sec_sorted[-1]
+        else:
+            before = sec_sorted[idx - 1]
+            after  = sec_sorted[idx]
+            nearest = before if abs((t - sec_times[idx - 1]).total_seconds()) <= abs((sec_times[idx] - t).total_seconds()) else after
+
+        merged.append({**nearest, **point})
+
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # OpenF1-backed tools (live telemetry)
 # ---------------------------------------------------------------------------
 
@@ -502,7 +552,6 @@ def get_telemetry(session_id: int, driver_ids: List[str], lap_number: int = None
                 date_start   = lap.get("date_start")
                 duration_sec = lap.get("lap_duration")
                 if date_start and duration_sec:
-                    from datetime import datetime, timedelta
                     dt_start = datetime.fromisoformat(date_start.replace("Z", "+00:00"))
                     dt_end   = dt_start + timedelta(seconds=duration_sec)
                     params["date>"] = dt_start.isoformat()
@@ -549,8 +598,7 @@ def get_corner_analysis(session_id: int, name_acronym: str):
     if not car_data or not location_data:
         return {"error": "No OpenF1 data available for this driver/session."}
 
-    min_len = min(len(car_data), len(location_data))
-    merged  = [{**car_data[i], **location_data[i]} for i in range(min_len)]
+    merged = _merge_by_timestamp(car_data, location_data)
 
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
