@@ -32,14 +32,17 @@ def _build_engine():
 _engine = _build_engine()
 
 
-def truncate_tool_response(tool_response_data, max_length=250):
-    """Truncate tool response to max_length characters"""
-    tool_response_str = json.dumps(tool_response_data)
-    if len(tool_response_str) <= max_length:
-        return tool_response_data
-    
-    truncated_str = tool_response_str[:max_length-3] + "..."
-    return truncated_str
+def truncate_tool_response(tool_response_data, max_items=20):
+    """Truncate tool response for DB storage while keeping valid JSON.
+    Lists are capped at max_items rows; other types are stored as-is.
+    """
+    if isinstance(tool_response_data, list) and len(tool_response_data) > max_items:
+        return {
+            "rows": tool_response_data[:max_items],
+            "truncated": True,
+            "total": len(tool_response_data),
+        }
+    return tool_response_data
 
 
 class Settings(BaseSettings):
@@ -195,7 +198,7 @@ async def process_query(request: ChatRequest):
                 else:
                     tool_response = tool["result"]
 
-                truncated_response = truncate_tool_response(tool_response, max_length=250)
+                truncated_response = truncate_tool_response(tool_response)
 
 
                 conn.execute(text("""
