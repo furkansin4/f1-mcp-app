@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import Optional
 from contextlib import AsyncExitStack
 import logging
@@ -8,6 +9,7 @@ from mcp.client.stdio import stdio_client
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from history_utils import build_turns
 
 load_dotenv()  # load environment variables from .env
 
@@ -196,13 +198,70 @@ class MCPClient:
     def clear_conversation_history(self):
         self.conversation_history = []
 
-    def load_conversation_history(self, messages: list):
-        """Restore conversation history from persisted messages."""
-        self.conversation_history = [
-            {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
-            for m in messages
-            if m["role"] in ("user", "assistant")
-        ]
+    def get_text_history(self) -> list:
+        result = []
+        for msg in self.conversation_history:
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                result.append({"role": role, "content": content})
+            elif isinstance(content, list):
+                text_parts = [
+                    b.text for b in content
+                    if hasattr(b, "type") and b.type == "text" and hasattr(b, "text")
+                ]
+                if not text_parts:
+                    text_parts = [
+                        b["text"] for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                if text_parts:
+                    result.append({"role": role, "content": " ".join(text_parts)})
+        return result
+
+    def load_conversation_history(self, messages: list, tool_executions: list = None):
+        """Restore conversation history, including tool call/result pairs when available."""
+        self.conversation_history = []
+
+        if not tool_executions:
+            self.conversation_history = [
+                {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
+                for m in messages if m.get("role") in ("user", "assistant")
+            ]
+            return
+
+        for turn in build_turns(messages, tool_executions):
+            self.conversation_history.append({"role": "user", "content": turn["user"]["content"]})
+
+            if turn["tools"]:
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"toolu_{t['id']}",
+                            "name": t["tool_name"],
+                            "input": t["tool_request"] if isinstance(t["tool_request"], dict) else json.loads(t["tool_request"]),
+                        }
+                        for t in turn["tools"]
+                    ],
+                })
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": f"toolu_{t['id']}",
+                            "content": (json.dumps(t["tool_response"]) if not isinstance(t["tool_response"], str) else t["tool_response"])[:1000],
+                        }
+                        for t in turn["tools"]
+                    ],
+                })
+
+            if turn["assistant"]:
+                self.conversation_history.append({"role": "assistant", "content": turn["assistant"]["content"]})
 
 async def main():
     import sys

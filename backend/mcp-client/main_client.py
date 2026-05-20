@@ -32,9 +32,10 @@ class MainClient:
         self._switch_client(llm_provider)
 
     def _switch_client(self, provider: Literal["anthropic", "openai", "gemini"]):
-        """Switch the current active client"""
+        """Switch the current active client, carrying over text history."""
+        old_history = self.get_text_history()
+
         self.llm_provider = provider
-        
         if provider == "anthropic":
             self.current_client = self.claude_client
         elif provider == "openai":
@@ -43,6 +44,9 @@ class MainClient:
             self.current_client = self.gemini_client
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}. Use 'anthropic', 'openai', or 'gemini'.")
+
+        if old_history:
+            self.current_client.load_conversation_history(old_history)
 
     async def connect_to_server(self, server_script_path: str) -> bool:
         """
@@ -118,10 +122,15 @@ class MainClient:
         if self.current_client:
             self.current_client.clear_conversation_history()
 
-    def load_conversation_history(self, messages: list):
-        """Load persisted messages into the active client's context."""
+    def get_text_history(self) -> list:
+        if self.current_client and hasattr(self.current_client, "get_text_history"):
+            return self.current_client.get_text_history()
+        return []
+
+    def load_conversation_history(self, messages: list, tool_executions: list = None):
+        """Load persisted messages (and optional tool executions) into the active client's context."""
         if self.current_client:
-            self.current_client.load_conversation_history(messages)
+            self.current_client.load_conversation_history(messages, tool_executions or [])
 
     def set_model(self, provider: Literal["anthropic", "openai", "gemini"]):
         """Switch to a different LLM provider"""

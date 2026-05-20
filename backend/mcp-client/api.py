@@ -142,12 +142,19 @@ async def process_query(request: ChatRequest):
                 if not result.fetchone():
                     raise HTTPException(status_code=404, detail="Conversation not found")
 
-                # Restore previous messages into the AI client's context
+                # Restore previous messages and tool executions into the AI client's context
                 history = conn.execute(
-                    text("SELECT role, message AS content FROM messages WHERE conversation_id = :id ORDER BY created_at ASC"),
+                    text("SELECT role, message AS content, created_at FROM messages WHERE conversation_id = :id ORDER BY created_at ASC"),
                     {"id": conversation_id},
                 ).fetchall()
-                app.state.client.load_conversation_history([dict(r._mapping) for r in history])
+                tool_execs = conn.execute(
+                    text("SELECT id, tool_name, tool_request, tool_response, created_at FROM tool_executions WHERE conversation_id = :id ORDER BY created_at ASC"),
+                    {"id": conversation_id},
+                ).fetchall()
+                app.state.client.load_conversation_history(
+                    [dict(r._mapping) for r in history],
+                    [dict(r._mapping) for r in tool_execs],
+                )
             else:
                 app.state.client.clear_conversation_history()
                 result = conn.execute(

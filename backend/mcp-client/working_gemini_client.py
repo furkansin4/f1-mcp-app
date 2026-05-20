@@ -20,6 +20,7 @@ from google.genai.types import Tool, FunctionDeclaration
 from google.genai.types import GenerateContentConfig
 
 from dotenv import load_dotenv
+from history_utils import build_turns
 
 load_dotenv()
 
@@ -239,19 +240,57 @@ class MCPClient:
     def clear_conversation_history(self):
         self.conversation_history = []
 
-    def load_conversation_history(self, messages: list):
-        """Restore conversation history from persisted messages."""
-        self.conversation_history = []
-        for m in messages:
-            if m["role"] not in ("user", "assistant"):
+    def get_text_history(self) -> list:
+        result = []
+        for content in self.conversation_history:
+            role = content.role
+            if role == "model":
+                role = "assistant"
+            elif role != "user":
                 continue
-            gemini_role = "model" if m["role"] == "assistant" else "user"
-            self.conversation_history.append(
-                types.Content(
-                    role=gemini_role,
-                    parts=[types.Part.from_text(text=m["content"])],
+            text_parts = [p.text for p in content.parts if hasattr(p, "text") and p.text]
+            if text_parts:
+                result.append({"role": role, "content": " ".join(text_parts)})
+        return result
+
+    def load_conversation_history(self, messages: list, tool_executions: list = None):
+        """Restore conversation history, including tool call/result pairs when available."""
+        self.conversation_history = []
+
+        if not tool_executions:
+            for m in messages:
+                if m.get("role") not in ("user", "assistant"):
+                    continue
+                gemini_role = "model" if m["role"] == "assistant" else "user"
+                self.conversation_history.append(
+                    types.Content(role=gemini_role, parts=[types.Part.from_text(text=m["content"])])
                 )
+            return
+
+        for turn in build_turns(messages, tool_executions):
+            self.conversation_history.append(
+                types.Content(role="user", parts=[types.Part.from_text(text=turn["user"]["content"])])
             )
+
+            for t in turn["tools"]:
+                args = t["tool_request"] if isinstance(t["tool_request"], dict) else json.loads(t["tool_request"])
+                self.conversation_history.append(
+                    types.Content(role="model", parts=[types.Part(function_call=types.FunctionCall(name=t["tool_name"], args=args))])
+                )
+                resp = t["tool_response"]
+                if isinstance(resp, str):
+                    try:
+                        resp = json.loads(resp)
+                    except Exception:
+                        resp = {"result": resp}
+                self.conversation_history.append(
+                    types.Content(role="function", parts=[types.Part.from_function_response(name=t["tool_name"], response={"result": resp})])
+                )
+
+            if turn["assistant"]:
+                self.conversation_history.append(
+                    types.Content(role="model", parts=[types.Part.from_text(text=turn["assistant"]["content"])])
+                )
 
     def get_conversation_length(self):
         """Get the number of messages in conversation history."""

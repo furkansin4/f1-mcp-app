@@ -9,6 +9,7 @@ from mcp.client.stdio import stdio_client
 
 from openai import OpenAI
 from dotenv import load_dotenv
+from history_utils import build_turns
 
 load_dotenv()  # load environment variables from .env
 
@@ -210,13 +211,54 @@ class MCPClient:
     def clear_conversation_history(self):
         self.conversation_history = []
 
-    def load_conversation_history(self, messages: list):
-        """Restore conversation history from persisted messages."""
-        self.conversation_history = [
-            {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
-            for m in messages
-            if m["role"] in ("user", "assistant")
+    def get_text_history(self) -> list:
+        return [
+            {"role": msg["role"], "content": msg["content"]}
+            for msg in self.conversation_history
+            if msg.get("role") in ("user", "assistant") and msg.get("content")
         ]
+
+    def load_conversation_history(self, messages: list, tool_executions: list = None):
+        """Restore conversation history, including tool call/result pairs when available."""
+        self.conversation_history = []
+
+        if not tool_executions:
+            self.conversation_history = [
+                {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
+                for m in messages if m.get("role") in ("user", "assistant")
+            ]
+            return
+
+        for turn in build_turns(messages, tool_executions):
+            self.conversation_history.append({"role": "user", "content": turn["user"]["content"]})
+
+            if turn["tools"]:
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call_{t['id']}",
+                            "type": "function",
+                            "function": {
+                                "name": t["tool_name"],
+                                "arguments": json.dumps(t["tool_request"]) if isinstance(t["tool_request"], dict) else t["tool_request"],
+                            },
+                        }
+                        for t in turn["tools"]
+                    ],
+                })
+                for t in turn["tools"]:
+                    resp = t["tool_response"]
+                    content = (json.dumps(resp) if not isinstance(resp, str) else resp)[:1000]
+                    self.conversation_history.append({
+                        "role": "tool",
+                        "tool_call_id": f"call_{t['id']}",
+                        "content": content,
+                    })
+
+            if turn["assistant"]:
+                self.conversation_history.append({"role": "assistant", "content": turn["assistant"]["content"]})
 
 async def main():
     import sys
