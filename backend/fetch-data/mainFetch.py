@@ -78,6 +78,10 @@ class OpenF1Pipeline:
             self._store_laps(session_key, session_id, driver_map)
             self._store_weather(session_key, session_id)
             self._store_race_control(session_key, session_id)
+            if session_name == 'Race':
+                self._store_race_results(session_key, session_id, driver_map)
+            elif session_name == 'Qualifying':
+                self._store_qualifying_results(session_id)
             logger.info(f"✓ {year} {location} {session_name}")
         except Exception as e:
             logger.error(f"✗ {year} {location} {session_name}: {e}")
@@ -256,6 +260,79 @@ class OpenF1Pipeline:
             conn.commit()
 
         logger.info(f"  Stored {len(messages)} race control messages")
+
+    def _store_race_results(self, session_key: int, session_id: int, driver_map: dict[int, str]):
+        """Derive final position, grid position and DNF from OpenF1 /position."""
+        positions = openf1_get("position", {"session_key": session_key})
+        if not positions:
+            logger.warning("  No position data from OpenF1, skipping race results")
+            return
+
+        first_pos: dict[int, int] = {}
+        last_pos: dict[int, int] = {}
+        for p in positions:
+            num = p.get('driver_number')
+            pos = p.get('position')
+            if num is None or pos is None:
+                continue
+            if num not in first_pos:
+                first_pos[num] = pos
+            last_pos[num] = pos
+
+        with self.engine.connect() as conn:
+            max_laps = conn.execute(text(
+                "SELECT MAX(lap_number) FROM laps WHERE session_id = :sid"
+            ), {"sid": session_id}).scalar() or 0
+
+            driver_lap_counts = {
+                row.driver_id: row.laps
+                for row in conn.execute(text(
+                    "SELECT driver_id, MAX(lap_number) AS laps FROM laps "
+                    "WHERE session_id = :sid GROUP BY driver_id"
+                ), {"sid": session_id})
+            }
+
+            for driver_num, final_pos in last_pos.items():
+                driver_id = driver_map.get(driver_num, str(driver_num))
+                grid_pos  = first_pos.get(driver_num)
+                lap_count = driver_lap_counts.get(driver_id, 0)
+                dnf       = bool(lap_count < (max_laps - 3))
+                status    = 'DNF' if dnf else 'Finished'
+
+                conn.execute(text("""
+                    UPDATE drivers SET
+                        position      = :pos,
+                        grid_position = :grid,
+                        dnf           = :dnf,
+                        status        = :status
+                    WHERE session_id = :session_id AND driver_id = :driver_id
+                """), {
+                    'pos': final_pos, 'grid': grid_pos,
+                    'dnf': dnf, 'status': status,
+                    'session_id': session_id, 'driver_id': driver_id,
+                })
+            conn.commit()
+
+        logger.info(f"  Updated race results for {len(last_pos)} drivers")
+
+    def _store_qualifying_results(self, session_id: int):
+        """Rank drivers by best lap time already in DB and store as qualifying position."""
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT driver_id, MIN(lap_time) AS best_time
+                FROM laps WHERE session_id = :sid AND lap_time IS NOT NULL
+                GROUP BY driver_id
+                ORDER BY best_time ASC
+            """), {"sid": session_id}).fetchall()
+
+            for rank, row in enumerate(rows, start=1):
+                conn.execute(text("""
+                    UPDATE drivers SET position = :pos
+                    WHERE session_id = :session_id AND driver_id = :driver_id
+                """), {'pos': rank, 'session_id': session_id, 'driver_id': row.driver_id})
+            conn.commit()
+
+        logger.info(f"  Updated qualifying positions for {len(rows)} drivers")
 
 
 if __name__ == "__main__":
