@@ -221,7 +221,7 @@ class OpenF1Pipeline:
                     'air_temp':      w.get('air_temperature'),
                     'humidity':      w.get('humidity'),
                     'pressure':      w.get('pressure'),
-                    'rainfall':      w.get('rainfall'),
+                    'rainfall':      bool(w.get('rainfall')),
                     'track_temp':    w.get('track_temperature'),
                     'wind_direction': w.get('wind_direction'),
                     'wind_speed':    w.get('wind_speed'),
