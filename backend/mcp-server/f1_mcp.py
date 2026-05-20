@@ -86,14 +86,18 @@ def _driver_number(session_id: int, name_acronym: str) -> Optional[str]:
 
 @mcp.tool
 def get_session_id(event_name: str, year: int, session_name: str = None):
-    """Get relevant session id for further tools"""
+    """Get relevant session id for further tools. event_name can be city (Melbourne), country (Australia), or GP name (Australian Grand Prix)."""
     conn = create_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            pattern = f"%{event_name.lower()}%"
+            en = event_name.lower()
             cur.execute(
-                "SELECT id, session_name, location FROM sessions "
-                "WHERE LOWER(location) LIKE %s AND year = %s",
-                (f"%{event_name.lower()}%", year),
+                "SELECT id, session_name, location, country_name FROM sessions "
+                "WHERE (LOWER(location) LIKE %s OR LOWER(country_name) LIKE %s "
+                "OR %s LIKE CONCAT('%%', LOWER(location), '%%') "
+                "OR %s LIKE CONCAT('%%', LOWER(country_name), '%%')) AND year = %s",
+                (pattern, pattern, en, en, year),
             )
             results = cur.fetchall()
             if session_name:
