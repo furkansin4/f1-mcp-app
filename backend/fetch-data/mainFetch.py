@@ -25,15 +25,10 @@ def openf1_get(endpoint: str, params: dict) -> list:
             f"{OPENF1_BASE}/{endpoint}",
             params={k: v for k, v in params.items() if v is not None},
         )
+        if response.status_code == 404:
+            return []
         response.raise_for_status()
         return response.json()
-
-
-def seconds_to_interval(value) -> str | None:
-    """Convert a float (seconds) to a PostgreSQL-compatible interval string."""
-    if value is None:
-        return None
-    return f"{float(value)} seconds"
 
 
 class OpenF1Pipeline:
@@ -79,9 +74,11 @@ class OpenF1Pipeline:
             self._store_weather(session_key, session_id)
             self._store_race_control(session_key, session_id)
             if session_name == 'Race':
-                self._store_race_results(session_key, session_id, driver_map)
+                self._store_race_results(session_key, session_id)
+                self._store_pits(session_key, session_id, driver_map)
+                self._store_overtakes(session_key, session_id)
             elif session_name == 'Qualifying':
-                self._store_qualifying_results(session_id)
+                self._store_qualifying_results(session_key, session_id)
             logger.info(f"✓ {year} {location} {session_name}")
         except Exception as e:
             logger.error(f"✗ {year} {location} {session_name}: {e}")
@@ -93,54 +90,71 @@ class OpenF1Pipeline:
     def _store_session(self, session: dict, year: int) -> int:
         with self.engine.connect() as conn:
             result = conn.execute(text("""
-                INSERT INTO sessions (season, event_name, session_name, date, openf1_session_key)
-                VALUES (:season, :event_name, :session_name, :date, :openf1_session_key)
-                ON CONFLICT (season, event_name, session_name)
-                DO UPDATE SET openf1_session_key = EXCLUDED.openf1_session_key
+                INSERT INTO sessions (
+                    session_key, meeting_key, year, location,
+                    country_name, country_code, circuit_short_name,
+                    session_name, session_type, date_start, date_end, gmt_offset
+                ) VALUES (
+                    :session_key, :meeting_key, :year, :location,
+                    :country_name, :country_code, :circuit_short_name,
+                    :session_name, :session_type, :date_start, :date_end, :gmt_offset
+                )
+                ON CONFLICT (session_key)
+                DO UPDATE SET
+                    meeting_key = EXCLUDED.meeting_key,
+                    date_start  = EXCLUDED.date_start,
+                    date_end    = EXCLUDED.date_end
                 RETURNING id
             """), {
-                'season':              year,
-                'event_name':          session.get('location'),
-                'session_name':        session.get('session_name'),
-                'date':                session.get('date_start'),
-                'openf1_session_key':  session.get('session_key'),
+                'session_key':        session.get('session_key'),
+                'meeting_key':        session.get('meeting_key'),
+                'year':               year,
+                'location':           session.get('location'),
+                'country_name':       session.get('country_name'),
+                'country_code':       session.get('country_code'),
+                'circuit_short_name': session.get('circuit_short_name'),
+                'session_name':       session.get('session_name'),
+                'session_type':       session.get('session_type'),
+                'date_start':         session.get('date_start'),
+                'date_end':           session.get('date_end'),
+                'gmt_offset':         session.get('gmt_offset'),
             })
             session_id = result.fetchone()[0]
             conn.commit()
         return session_id
 
     def _store_drivers(self, session_key: int, session_id: int) -> dict[int, str]:
-        """Store drivers and return {driver_number: abbreviation} map."""
+        """Store drivers and return {driver_number: name_acronym} map."""
         drivers = openf1_get("drivers", {"session_key": session_key})
         driver_map: dict[int, str] = {}
 
         with self.engine.connect() as conn:
             for d in drivers:
-                num   = d.get('driver_number')
-                abbr  = d.get('name_acronym', str(num))
+                num  = d.get('driver_number')
+                abbr = d.get('name_acronym', str(num))
                 driver_map[num] = abbr
 
                 conn.execute(text("""
                     INSERT INTO drivers (
-                        session_id, driver_number, broadcast_name, full_name,
-                        driver_id, team_name, team_color,
-                        first_name, last_name, headshot_url, country_code
+                        session_id, driver_number, name_acronym,
+                        broadcast_name, full_name, first_name, last_name,
+                        team_name, team_colour, headshot_url, country_code
                     ) VALUES (
-                        :session_id, :driver_number, :broadcast_name, :full_name,
-                        :driver_id, :team_name, :team_color,
-                        :first_name, :last_name, :headshot_url, :country_code
+                        :session_id, :driver_number, :name_acronym,
+                        :broadcast_name, :full_name, :first_name, :last_name,
+                        :team_name, :team_colour, :headshot_url, :country_code
                     )
                     ON CONFLICT (session_id, driver_number) DO NOTHING
                 """), {
                     'session_id':     session_id,
-                    'driver_number':  str(num),
+                    'driver_number':  num,
+                    'name_acronym':   abbr,
                     'broadcast_name': d.get('broadcast_name'),
                     'full_name':      d.get('full_name'),
-                    'driver_id':      abbr,
-                    'team_name':      d.get('team_name'),
-                    'team_color':     d.get('team_colour'),
                     'first_name':     d.get('first_name'),
                     'last_name':      d.get('last_name'),
+                    'team_name':      d.get('team_name'),
+                    'team_colour':    d.get('team_colour'),
                     'headshot_url':   d.get('headshot_url'),
                     'country_code':   d.get('country_code'),
                 })
@@ -153,55 +167,56 @@ class OpenF1Pipeline:
         laps   = openf1_get("laps",   {"session_key": session_key})
         stints = openf1_get("stints", {"session_key": session_key})
 
-        # Build stint lookup: (driver_number, lap_number) → {compound, tyre_life, stint}
         stint_lookup: dict[tuple, dict] = {}
         for s in stints:
-            for lap_no in range(s.get('lap_start', 0), s.get('lap_end', 0) + 1):
-                key = (s.get('driver_number'), lap_no)
-                stint_lookup[key] = {
-                    'compound':   s.get('compound'),
-                    'tyre_life':  lap_no - s.get('lap_start', 0) + 1,
-                    'stint':      s.get('stint_number'),
-                    'fresh_tyre': s.get('lap_start') == lap_no,
+            lap_start = s.get('lap_start', 0)
+            lap_end   = s.get('lap_end', 0)
+            for lap_no in range(lap_start, lap_end + 1):
+                stint_lookup[(s.get('driver_number'), lap_no)] = {
+                    'compound':          s.get('compound'),
+                    'tyre_age_at_start': s.get('tyre_age_at_start'),
+                    'stint_number':      s.get('stint_number'),
+                    'fresh_tyre':        s.get('tyre_age_at_start') == 0 and lap_no == lap_start,
                 }
 
         with self.engine.connect() as conn:
             for lap in laps:
-                num      = lap.get('driver_number')
-                lap_no   = lap.get('lap_number')
-                stint    = stint_lookup.get((num, lap_no), {})
-                driver_id = driver_map.get(num, str(num))
+                num    = lap.get('driver_number')
+                lap_no = lap.get('lap_number')
+                stint  = stint_lookup.get((num, lap_no), {})
 
                 conn.execute(text("""
                     INSERT INTO laps (
-                        session_id, driver_id, lap_number,
-                        lap_time, sector1_time, sector2_time, sector3_time,
-                        speed_i1, speed_i2, speed_st,
-                        compound, tyre_life, fresh_tyre, stint,
-                        is_personal_best
+                        session_id, driver_number, name_acronym, lap_number,
+                        lap_duration, date_start,
+                        duration_sector_1, duration_sector_2, duration_sector_3,
+                        i1_speed, i2_speed, st_speed, is_pit_out_lap,
+                        compound, tyre_age_at_start, stint_number, fresh_tyre
                     ) VALUES (
-                        :session_id, :driver_id, :lap_number,
-                        :lap_time, :sector1_time, :sector2_time, :sector3_time,
-                        :speed_i1, :speed_i2, :speed_st,
-                        :compound, :tyre_life, :fresh_tyre, :stint,
-                        :is_personal_best
+                        :session_id, :driver_number, :name_acronym, :lap_number,
+                        :lap_duration, :date_start,
+                        :duration_sector_1, :duration_sector_2, :duration_sector_3,
+                        :i1_speed, :i2_speed, :st_speed, :is_pit_out_lap,
+                        :compound, :tyre_age_at_start, :stint_number, :fresh_tyre
                     )
                 """), {
-                    'session_id':     session_id,
-                    'driver_id':      driver_id,
-                    'lap_number':     lap_no,
-                    'lap_time':       seconds_to_interval(lap.get('lap_duration')),
-                    'sector1_time':   seconds_to_interval(lap.get('duration_sector_1')),
-                    'sector2_time':   seconds_to_interval(lap.get('duration_sector_2')),
-                    'sector3_time':   seconds_to_interval(lap.get('duration_sector_3')),
-                    'speed_i1':       lap.get('i1_speed'),
-                    'speed_i2':       lap.get('i2_speed'),
-                    'speed_st':       lap.get('st_speed'),
-                    'compound':       stint.get('compound'),
-                    'tyre_life':      stint.get('tyre_life'),
-                    'fresh_tyre':     stint.get('fresh_tyre'),
-                    'stint':          stint.get('stint'),
-                    'is_personal_best': lap.get('is_pit_out_lap') is False and lap.get('lap_duration') is not None,
+                    'session_id':        session_id,
+                    'driver_number':     num,
+                    'name_acronym':      driver_map.get(num, str(num)),
+                    'lap_number':        lap_no,
+                    'lap_duration':      lap.get('lap_duration'),
+                    'date_start':        lap.get('date_start'),
+                    'duration_sector_1': lap.get('duration_sector_1'),
+                    'duration_sector_2': lap.get('duration_sector_2'),
+                    'duration_sector_3': lap.get('duration_sector_3'),
+                    'i1_speed':          lap.get('i1_speed'),
+                    'i2_speed':          lap.get('i2_speed'),
+                    'st_speed':          lap.get('st_speed'),
+                    'is_pit_out_lap':    lap.get('is_pit_out_lap'),
+                    'compound':          stint.get('compound'),
+                    'tyre_age_at_start': stint.get('tyre_age_at_start'),
+                    'stint_number':      stint.get('stint_number'),
+                    'fresh_tyre':        stint.get('fresh_tyre'),
                 })
             conn.commit()
 
@@ -214,21 +229,22 @@ class OpenF1Pipeline:
             for w in weather:
                 conn.execute(text("""
                     INSERT INTO weather (
-                        session_id, air_temp, humidity, pressure,
-                        rainfall, track_temp, wind_direction, wind_speed
+                        session_id, date, air_temperature, humidity, pressure,
+                        rainfall, track_temperature, wind_direction, wind_speed
                     ) VALUES (
-                        :session_id, :air_temp, :humidity, :pressure,
-                        :rainfall, :track_temp, :wind_direction, :wind_speed
+                        :session_id, :date, :air_temperature, :humidity, :pressure,
+                        :rainfall, :track_temperature, :wind_direction, :wind_speed
                     )
                 """), {
-                    'session_id':    session_id,
-                    'air_temp':      w.get('air_temperature'),
-                    'humidity':      w.get('humidity'),
-                    'pressure':      w.get('pressure'),
-                    'rainfall':      bool(w.get('rainfall')),
-                    'track_temp':    w.get('track_temperature'),
-                    'wind_direction': w.get('wind_direction'),
-                    'wind_speed':    w.get('wind_speed'),
+                    'session_id':        session_id,
+                    'date':              w.get('date'),
+                    'air_temperature':   w.get('air_temperature'),
+                    'humidity':          w.get('humidity'),
+                    'pressure':          w.get('pressure'),
+                    'rainfall':          bool(w.get('rainfall')),
+                    'track_temperature': w.get('track_temperature'),
+                    'wind_direction':    w.get('wind_direction'),
+                    'wind_speed':        w.get('wind_speed'),
                 })
             conn.commit()
 
@@ -241,104 +257,164 @@ class OpenF1Pipeline:
             for msg in messages:
                 conn.execute(text("""
                     INSERT INTO race_control (
-                        session_id, category, message, flag,
-                        scope, sector, racing_number, lap
+                        session_id, date, category, message, flag,
+                        scope, sector, driver_number, lap_number, qualifying_phase
                     ) VALUES (
-                        :session_id, :category, :message, :flag,
-                        :scope, :sector, :racing_number, :lap
+                        :session_id, :date, :category, :message, :flag,
+                        :scope, :sector, :driver_number, :lap_number, :qualifying_phase
                     )
                 """), {
-                    'session_id':    session_id,
-                    'category':      msg.get('category'),
-                    'message':       msg.get('message'),
-                    'flag':          msg.get('flag'),
-                    'scope':         msg.get('scope'),
-                    'sector':        str(msg.get('sector')) if msg.get('sector') else None,
-                    'racing_number': str(msg.get('driver_number')) if msg.get('driver_number') else None,
-                    'lap':           msg.get('lap_number'),
+                    'session_id':       session_id,
+                    'date':             msg.get('date'),
+                    'category':         msg.get('category'),
+                    'message':          msg.get('message'),
+                    'flag':             msg.get('flag'),
+                    'scope':            msg.get('scope'),
+                    'sector':           msg.get('sector'),
+                    'driver_number':    msg.get('driver_number'),
+                    'lap_number':       msg.get('lap_number'),
+                    'qualifying_phase': msg.get('qualifying_phase'),
                 })
             conn.commit()
 
         logger.info(f"  Stored {len(messages)} race control messages")
 
-    def _store_race_results(self, session_key: int, session_id: int, driver_map: dict[int, str]):
-        """Derive final position, grid position and DNF from OpenF1 /position."""
-        positions = openf1_get("position", {"session_key": session_key})
-        if not positions:
-            logger.warning("  No position data from OpenF1, skipping race results")
-            return
+    def _store_race_results(self, session_key: int, session_id: int):
+        """Store final race results from /session_result and grid from /starting_grid."""
+        results = openf1_get("session_result", {"session_key": session_key})
+        try:
+            grid = openf1_get("starting_grid", {"session_key": session_key})
+        except Exception:
+            grid = []
+            logger.warning("  starting_grid not available, grid positions will be empty")
 
-        first_pos: dict[int, int] = {}
-        last_pos: dict[int, int] = {}
-        for p in positions:
-            num = p.get('driver_number')
-            pos = p.get('position')
-            if num is None or pos is None:
-                continue
-            if num not in first_pos:
-                first_pos[num] = pos
-            last_pos[num] = pos
+        grid_map = {g.get('driver_number'): g.get('position') for g in grid}
 
         with self.engine.connect() as conn:
-            max_laps = conn.execute(text(
-                "SELECT MAX(lap_number) FROM laps WHERE session_id = :sid"
-            ), {"sid": session_id}).scalar() or 0
-
-            driver_lap_counts = {
-                row.driver_id: row.laps
-                for row in conn.execute(text(
-                    "SELECT driver_id, MAX(lap_number) AS laps FROM laps "
-                    "WHERE session_id = :sid GROUP BY driver_id"
-                ), {"sid": session_id})
-            }
-
-            for driver_num, final_pos in last_pos.items():
-                driver_id = driver_map.get(driver_num, str(driver_num))
-                grid_pos  = first_pos.get(driver_num)
-                lap_count = driver_lap_counts.get(driver_id, 0)
-                dnf       = bool(lap_count < (max_laps - 3))
-                status    = 'DNF' if dnf else 'Finished'
+            for r in results:
+                driver_num = r.get('driver_number')
+                dnf  = bool(r.get('dnf'))
+                dns  = bool(r.get('dns'))
+                dsq  = bool(r.get('dsq'))
+                if dsq:
+                    status = 'DSQ'
+                elif dns:
+                    status = 'DNS'
+                elif dnf:
+                    status = 'DNF'
+                else:
+                    status = 'Finished'
 
                 conn.execute(text("""
                     UPDATE drivers SET
                         position      = :pos,
                         grid_position = :grid,
                         dnf           = :dnf,
-                        status        = :status
-                    WHERE session_id = :session_id AND driver_id = :driver_id
+                        dns           = :dns,
+                        dsq           = :dsq,
+                        status        = :status,
+                        gap_to_leader = :gap,
+                        number_of_laps = :laps,
+                        race_duration  = :duration
+                    WHERE session_id = :session_id AND driver_number = :driver_number
                 """), {
-                    'pos': final_pos, 'grid': grid_pos,
-                    'dnf': dnf, 'status': status,
-                    'session_id': session_id, 'driver_id': driver_id,
+                    'pos':           r.get('position'),
+                    'grid':          grid_map.get(driver_num),
+                    'dnf':           dnf,
+                    'dns':           dns,
+                    'dsq':           dsq,
+                    'status':        status,
+                    'gap':           str(r.get('gap_to_leader')) if r.get('gap_to_leader') is not None else None,
+                    'laps':          r.get('number_of_laps'),
+                    'duration':      r.get('duration'),
+                    'session_id':    session_id,
+                    'driver_number': driver_num,
                 })
             conn.commit()
 
-        logger.info(f"  Updated race results for {len(last_pos)} drivers")
+        logger.info(f"  Stored race results for {len(results)} drivers")
 
-    def _store_qualifying_results(self, session_id: int):
-        """Rank drivers by best lap time already in DB and store as qualifying position."""
+    def _store_qualifying_results(self, session_key: int, session_id: int):
+        """Store qualifying positions and best lap from /session_result."""
+        results = openf1_get("session_result", {"session_key": session_key})
+
         with self.engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT driver_id, MIN(lap_time) AS best_time
-                FROM laps WHERE session_id = :sid AND lap_time IS NOT NULL
-                GROUP BY driver_id
-                ORDER BY best_time ASC
-            """), {"sid": session_id}).fetchall()
+            for r in results:
+                duration = r.get('duration')
+                # Qualifying duration comes as an array [Q1, Q2, Q3] — take the best
+                if isinstance(duration, list):
+                    duration = min(t for t in duration if t is not None) if duration else None
 
-            for rank, row in enumerate(rows, start=1):
                 conn.execute(text("""
-                    UPDATE drivers SET position = :pos
-                    WHERE session_id = :session_id AND driver_id = :driver_id
-                """), {'pos': rank, 'session_id': session_id, 'driver_id': row.driver_id})
+                    UPDATE drivers SET
+                        position      = :pos,
+                        race_duration = :duration
+                    WHERE session_id = :session_id AND driver_number = :driver_number
+                """), {
+                    'pos':           r.get('position'),
+                    'duration':      duration,
+                    'session_id':    session_id,
+                    'driver_number': r.get('driver_number'),
+                })
             conn.commit()
 
-        logger.info(f"  Updated qualifying positions for {len(rows)} drivers")
+        logger.info(f"  Stored qualifying results for {len(results)} drivers")
+
+    def _store_pits(self, session_key: int, session_id: int, driver_map: dict[int, str]):
+        pits = openf1_get("pit", {"session_key": session_key})
+
+        with self.engine.connect() as conn:
+            for p in pits:
+                num = p.get('driver_number')
+                conn.execute(text("""
+                    INSERT INTO pits (
+                        session_id, driver_number, name_acronym,
+                        lap_number, stop_duration, lane_duration, date
+                    ) VALUES (
+                        :session_id, :driver_number, :name_acronym,
+                        :lap_number, :stop_duration, :lane_duration, :date
+                    )
+                """), {
+                    'session_id':    session_id,
+                    'driver_number': num,
+                    'name_acronym':  driver_map.get(num, str(num)),
+                    'lap_number':    p.get('lap_number'),
+                    'stop_duration': p.get('stop_duration') or p.get('lane_duration'),
+                    'lane_duration': p.get('lane_duration'),
+                    'date':          p.get('date'),
+                })
+            conn.commit()
+
+        logger.info(f"  Stored {len(pits)} pit stops")
+
+    def _store_overtakes(self, session_key: int, session_id: int):
+        overtakes = openf1_get("overtakes", {"session_key": session_key})
+
+        with self.engine.connect() as conn:
+            for o in overtakes:
+                conn.execute(text("""
+                    INSERT INTO overtakes (
+                        session_id, overtaking_driver_number,
+                        overtaken_driver_number, position, date
+                    ) VALUES (
+                        :session_id, :overtaking, :overtaken, :position, :date
+                    )
+                """), {
+                    'session_id': session_id,
+                    'overtaking': o.get('overtaking_driver_number'),
+                    'overtaken':  o.get('overtaken_driver_number'),
+                    'position':   o.get('position'),
+                    'date':       o.get('date'),
+                })
+            conn.commit()
+
+        logger.info(f"  Stored {len(overtakes)} overtakes")
 
 
 if __name__ == "__main__":
     pipeline = OpenF1Pipeline()
 
-    years         = [2024, 2025]
+    years         = [2026]
     session_types = ['Qualifying', 'Race']
 
     for year in years:
